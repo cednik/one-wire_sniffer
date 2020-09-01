@@ -8,6 +8,8 @@
 
 #include <format.h>
 
+using fmt::print;
+
 class Pin {
 public:
     typedef uint8_t pin_num_t;
@@ -42,12 +44,12 @@ private:
     const bool m_inverted;
 };
 
-class Timer {
+class HWTimer {
 public:
     typedef uint16_t divider_t;
     typedef uint64_t value_t;
 
-    Timer(timer_group_t group_num, timer_idx_t timer_num, divider_t divider = 1)
+    HWTimer(timer_group_t group_num, timer_idx_t timer_num, divider_t divider = 1)
         : m_group_num(group_num),
           m_timer_num(timer_num),
           m_lock(s_lock[m_group_num][m_timer_num]),
@@ -90,24 +92,37 @@ private:
     static portMUX_TYPE s_lock[TIMER_GROUP_MAX][TIMER_MAX];
     static timg_dev_t* const s_group[TIMER_GROUP_MAX];
 };
-portMUX_TYPE Timer::s_lock[TIMER_GROUP_MAX][TIMER_MAX] = {
+portMUX_TYPE HWTimer::s_lock[TIMER_GROUP_MAX][TIMER_MAX] = {
     { portMUX_INITIALIZER_UNLOCKED,
       portMUX_INITIALIZER_UNLOCKED },
     { portMUX_INITIALIZER_UNLOCKED,
       portMUX_INITIALIZER_UNLOCKED }
  };
-timg_dev_t* const Timer::s_group[TIMER_GROUP_MAX] = { &TIMERG0, &TIMERG1 };
+timg_dev_t* const HWTimer::s_group[TIMER_GROUP_MAX] = { &TIMERG0, &TIMERG1 };
+
+class fastestTimer {
+public:
+    typedef uint32_t value_t;
+    inline static value_t INTR_ATTR value() { return xthal_get_ccount(); }
+};
+
+template <class Timer>
+void INTR_ATTR wait(typename Timer::value_t t) {
+    t += Timer::value();
+    while(Timer::value() < t);
+}
 
 class OneWire {
+    typedef fastestTimer Timer;
 public:
     struct Timing {
-        typedef uint16_t time_t; // 1 = 0.5 us
+        typedef Timer::value_t time_t; // in CPU ticks -> 1 / 240 MHz
         // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
         time_t A,B,C,D,E,F,G,H,I,J;
     };
     static const Timing Standard;
     static const Timing Overdrive;
-    OneWire(Pin input, Pin output, Pin boost, const Timing* timing = &Standard)
+    OneWire(Pin input, Pin output, Pin boost = Pin(DUMMY_PIN), const Timing* timing = &Standard)
         : m_input(input),
           m_output(output),
           m_boost(boost),
@@ -115,15 +130,51 @@ public:
           m_lock(portMUX_INITIALIZER_UNLOCKED)
     {}
 
-private:
-    void _writeBit(bool v)
-    {
+//private:
+    void _writeBit(const bool v) {
+        const Timer::value_t pre  = v ? m_timing->A : m_timing->C;
+        const Timer::value_t post = v ? m_timing->B : m_timing->D;
         portENTER_CRITICAL(&m_lock);
         m_output.setLow();
-        if (v) {
-
-        }
+        wait<Timer>(pre);
+        m_output.setHigh();
+        wait<Timer>(post);
         portEXIT_CRITICAL(&m_lock);
+    }
+    bool _readBit() {
+        portENTER_CRITICAL(&m_lock);
+        m_output.setLow();
+        wait<Timer>(m_timing->A);
+        m_output.setHigh();
+        wait<Timer>(m_timing->E);
+        const bool v = m_input.read();
+        wait<Timer>(m_timing->F);
+        portEXIT_CRITICAL(&m_lock);
+        return v;
+    }
+    bool reset() {
+        portENTER_CRITICAL(&m_lock);
+        wait<Timer>(m_timing->G);
+        m_output.setLow();
+        wait<Timer>(m_timing->H);
+        m_output.setHigh();
+        wait<Timer>(m_timing->I);
+        const bool v = m_input.read();
+        wait<Timer>(m_timing->J);
+        portEXIT_CRITICAL(&m_lock);
+        return !v;
+    }
+    void _write(uint8_t v) {
+        for (uint8_t i = 1; i != 0; i<<=1)
+            _writeBit(v & i);
+    }
+    uint8_t _read() {
+        uint8_t v = 0;
+        for(uint8_t i = 0; i != 8; ++i) {
+            v |= _readBit();
+            v <<= 1;
+        }
+        return v;
     }
 
     Pin m_input;
@@ -132,51 +183,44 @@ private:
     const Timing* m_timing;
     portMUX_TYPE m_lock;
 };
+#define US2TICKS(us) OneWire::Timing::time_t(us * 240)
 // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
 const OneWire::Timing OneWire::Standard = {
-    .A =  12,
-    .B = 128,
-    .C = 120,
-    .D =  20,
-    .E =  18,
-    .F = 110,
-    .G =   0,
-    .H = 960,
-    .I = 140,
-    .J = 820
+    .A = US2TICKS(  6),
+    .B = US2TICKS( 64),
+    .C = US2TICKS( 60),
+    .D = US2TICKS( 10),
+    .E = US2TICKS(  9),
+    .F = US2TICKS( 55),
+    .G = US2TICKS(  0),
+    .H = US2TICKS(480),
+    .I = US2TICKS( 70),
+    .J = US2TICKS(410)
 };
 const OneWire::Timing OneWire::Overdrive = {
-    .A =   2,
-    .B =  15,
-    .C =  15,
-    .D =   5,
-    .E =   2,
-    .F =  14,
-    .G =   5,
-    .H = 140,
-    .I =  17,
-    .J =  80
+    .A = US2TICKS(  1.0),
+    .B = US2TICKS(  7.5),
+    .C = US2TICKS(  7.5),
+    .D = US2TICKS(  2.5),
+    .E = US2TICKS(  1.0),
+    .F = US2TICKS(  7.0),
+    .G = US2TICKS(  2.5),
+    .H = US2TICKS( 70.0),
+    .I = US2TICKS(  8.5),
+    .J = US2TICKS( 40.0)
 };
-
-Timer tmr0(TIMER_GROUP_0, TIMER_0, 80);
 
 void setup() {
     Serial.begin(115200);
-    fmt::print("OneWire sniffer\n");
-    const size_t l = 1000;
-    uint32_t* t = new uint32_t[l];
-    for (size_t i = 0; i != l; ++i)
-        //t[i] = tmr0.value();
-        t[i] = xthal_get_ccount();
-    for (size_t i = 0; i != l; ++i)
-        fmt::print("{:8}\n", t[i]);
-    fmt::print("{:8} - {} = {} / {}\n", t[l-1], t[0], t[l-1] - t[0], l);
-    delete t;
+    print("OneWire sniffer\n");
+    const Pin::pin_num_t onewirePin = 21;
+    OneWire ow(Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP), Pin(onewirePin));
+    for(;;) {
+        bool presence = ow.reset();
+        ow._write(0xAA);
+        print("presence: {}\n", presence);
+        delay(1000);
+    }
 }
 
-void loop() {
-    //uint64_t v = tmr0.value();
-    uint32_t v = xthal_get_ccount();
-    fmt::print("{:10}\n", v);
-    delay(1000);
-}
+void loop() {}
