@@ -6,6 +6,8 @@
 
 #define DUMMY_PIN 40
 
+#include <format.h>
+
 class Pin {
 public:
     typedef uint8_t pin_num_t;
@@ -14,7 +16,7 @@ public:
     typedef uint8_t pin_mode_t;
     typedef int intr_mode_t;
     static const pin_mode_t KEEP_CURRENT = 255;
-    Pin(pin_num_t pin, bool inverted = false, pin_mode_t mode = KEEP_CURRENT)
+    Pin(pin_num_t pin, pin_mode_t mode = KEEP_CURRENT, bool inverted = false)
         : m_pin(pin),
           m_inverted(inverted)
     {
@@ -40,71 +42,21 @@ private:
     const bool m_inverted;
 };
 
-class ISRGuard {
-public:
-    INTR_ATTR ISRGuard() { portENTER_CRITICAL_ISR(&mux); }
-    INTR_ATTR ~ISRGuard() { portEXIT_CRITICAL_ISR(&mux); }
-private:
-    static portMUX_TYPE mux;
-};
-portMUX_TYPE ISRGuard::mux = portMUX_INITIALIZER_UNLOCKED;
-
-#include "allocator.hpp"
-
-template<class T, class Alloc = allocator<T> >
-class SortedList {
-    struct Item {
-        T* item;
-        Item* prev;
-        Item* next;
-    };
-public:
-    typedef Alloc allocator_type;
-    typedef uintptr_t handle_t;
-    INTR_ATTR SortedList(const allocator_type& alloc = allocator_type())
-        : m_allocator(alloc),
-          m_first(nullptr),
-          m_last(nullptr)
-    {}
-    handle_t INTR_ATTR add() {
-        return 0;
-    }
-private:
-    allocator_type m_allocator;
-    Item* m_first;
-    Item* m_last;
-};
-
 class Timer {
 public:
-    typedef void* callback_arg_t;
-    typedef void (*callback_t)(callback_arg_t);
     typedef uint16_t divider_t;
     typedef uint64_t value_t;
-private:
-    struct ScheduleItem {
-        INTR_ATTR ScheduleItem (value_t time, callback_t callback, callback_arg_t callback_arg)
-            : m_time(time),
-              m_callback(callback),
-              m_callback_arg(callback_arg)
-        {}
-        void INTR_ATTR operator ()() { m_callback(m_callback_arg); }
-        bool INTR_ATTR operator < (const ScheduleItem& rhs) const { return m_time < rhs.m_time; }
-    private:
-        const value_t m_time;
-        callback_t m_callback;
-        callback_arg_t m_callback_arg;
-    };
-    typedef SortedList<ScheduleItem> ScheduleItems;
-public:
-    typedef ScheduleItems::handle_t handle_t;
-    Timer(timer_group_t group_num, timer_idx_t timer_num, divider_t divider = 2)
+
+    Timer(timer_group_t group_num, timer_idx_t timer_num, divider_t divider = 1)
         : m_group_num(group_num),
           m_timer_num(timer_num),
-          m_scheduled_items()
+          m_lock(s_lock[m_group_num][m_timer_num]),
+          m_update  (s_group[m_group_num]->hw_timer[m_timer_num].update  ),
+          m_cnt_high(s_group[m_group_num]->hw_timer[m_timer_num].cnt_high),
+          m_cnt_low (s_group[m_group_num]->hw_timer[m_timer_num].cnt_low )
     {
         timer_config_t cfg = {
-            .alarm_en = TIMER_ALARM_EN,
+            .alarm_en = TIMER_ALARM_DIS,
             .counter_en = TIMER_PAUSE,
             .intr_type = TIMER_INTR_LEVEL,
             .counter_dir = TIMER_COUNT_UP,
@@ -117,29 +69,112 @@ public:
         if (divider != 0)
             timer_start(m_group_num, m_timer_num);
     }
-    value_t INTR_ATTR value() const { return 0; } //timer_group_get_counter_value_in_isr(m_group_num, m_timer_num); }
-    handle_t schedule(value_t when, callback_t callback, callback_arg_t callback_arg) {
-        return m_scheduled_items.add();
+    value_t INTR_ATTR value() const {
+        portENTER_CRITICAL_ISR(&m_lock);
+        m_update = 1;
+        uint64_t h = m_cnt_high;
+        uint64_t l = m_cnt_low;
+        portEXIT_CRITICAL_ISR(&m_lock);
+        return (h << 32) | l;
     }
+    
 private:
     const timer_group_t m_group_num;
     const timer_idx_t m_timer_num;
-    ScheduleItems m_scheduled_items;
+
+    portMUX_TYPE& m_lock;
+    volatile uint32_t& m_update;
+    volatile uint32_t& m_cnt_high;
+    volatile uint32_t& m_cnt_low;
+
+    static portMUX_TYPE s_lock[TIMER_GROUP_MAX][TIMER_MAX];
+    static timg_dev_t* const s_group[TIMER_GROUP_MAX];
 };
+portMUX_TYPE Timer::s_lock[TIMER_GROUP_MAX][TIMER_MAX] = {
+    { portMUX_INITIALIZER_UNLOCKED,
+      portMUX_INITIALIZER_UNLOCKED },
+    { portMUX_INITIALIZER_UNLOCKED,
+      portMUX_INITIALIZER_UNLOCKED }
+ };
+timg_dev_t* const Timer::s_group[TIMER_GROUP_MAX] = { &TIMERG0, &TIMERG1 };
 
 class OneWire {
 public:
-    OneWire(
-        Pin input, Pin output, Pin boost, Timer timer
-    ){}
+    struct Timing {
+        typedef uint16_t time_t; // 1 = 0.5 us
+        // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
+        time_t A,B,C,D,E,F,G,H,I,J;
+    };
+    static const Timing Standard;
+    static const Timing Overdrive;
+    OneWire(Pin input, Pin output, Pin boost, const Timing* timing = &Standard)
+        : m_input(input),
+          m_output(output),
+          m_boost(boost),
+          m_timing(timing),
+          m_lock(portMUX_INITIALIZER_UNLOCKED)
+    {}
+
 private:
-    
+    void _writeBit(bool v)
+    {
+        portENTER_CRITICAL(&m_lock);
+        m_output.setLow();
+        if (v) {
+
+        }
+        portEXIT_CRITICAL(&m_lock);
+    }
+
+    Pin m_input;
+    Pin m_output;
+    Pin m_boost;
+    const Timing* m_timing;
+    portMUX_TYPE m_lock;
+};
+// based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
+const OneWire::Timing OneWire::Standard = {
+    .A =  12,
+    .B = 128,
+    .C = 120,
+    .D =  20,
+    .E =  18,
+    .F = 110,
+    .G =   0,
+    .H = 960,
+    .I = 140,
+    .J = 820
+};
+const OneWire::Timing OneWire::Overdrive = {
+    .A =   2,
+    .B =  15,
+    .C =  15,
+    .D =   5,
+    .E =   2,
+    .F =  14,
+    .G =   5,
+    .H = 140,
+    .I =  17,
+    .J =  80
 };
 
+Timer tmr0(TIMER_GROUP_0, TIMER_0, 80);
+
 void setup() {
-    // put your setup code here, to run once:
+    Serial.begin(115200);
+    fmt::print("OneWire sniffer\n");
+    const size_t l = 1000;
+    uint64_t* t = new uint64_t[l];
+    for (size_t i = 0; i != l; ++i)
+        t[i] = tmr0.value();
+    for (size_t i = 0; i != l; ++i)
+        fmt::print("{:8}\n", t[i]);
+    fmt::print("{:8} - {} = {} / {}\n", t[l-1], t[0], t[l-1] - t[0], l);
+    delete t;
 }
 
 void loop() {
-    // put your main code here, to run repeatedly:
+    uint64_t v = tmr0.value();
+    fmt::print("{:8}\n", v);
+    delay(1000);
 }
