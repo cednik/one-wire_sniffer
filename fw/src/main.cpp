@@ -164,9 +164,10 @@ void setup() {
     Serial.begin(115200);
     fmt::print("OneWire sniffer\n");
     const size_t l = 1000;
-    uint64_t* t = new uint64_t[l];
+    uint32_t* t = new uint32_t[l];
     for (size_t i = 0; i != l; ++i)
-        t[i] = tmr0.value();
+        //t[i] = tmr0.value();
+        t[i] = xthal_get_ccount();
     for (size_t i = 0; i != l; ++i)
         fmt::print("{:8}\n", t[i]);
     fmt::print("{:8} - {} = {} / {}\n", t[l-1], t[0], t[l-1] - t[0], l);
@@ -174,7 +175,8 @@ void setup() {
 }
 
 void loop() {
-    uint64_t v = tmr0.value();
-    fmt::print("{:8}\n", v);
+    //uint64_t v = tmr0.value();
+    uint32_t v = xthal_get_ccount();
+    fmt::print("{:10}\n", v);
     delay(1000);
 }
