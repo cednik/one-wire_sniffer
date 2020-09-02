@@ -1,4 +1,9 @@
+#include "esp_log.h"
 #include <Arduino.h>
+#include "esp_system.h"
+extern "C" {
+#include "bootloader_random.h"
+} // extern "C"
 
 #include "driver/timer.h"
 
@@ -8,7 +13,59 @@
 
 #include <format.h>
 
-using fmt::print;
+template <typename S, typename... Args>
+inline void print(const S& format_str, Args&&... args);
+
+class Printer {
+public:
+    static bool begin(size_t queueSize = 128, uint32_t stackSize = 1024, UBaseType_t priority = 4) {
+        if (queue != nullptr) {
+            ESP_LOGE("Printer::init", "Already initialized.");
+            return false;
+        }
+        queue = xQueueCreate(queueSize, sizeof(fmt::memory_buffer*));
+        if (queue == nullptr) {
+            ESP_LOGE("Printer::init", "Can not create queue.");
+            return false;
+        }
+        BaseType_t ret = xTaskCreate(process, "Printer::process", stackSize, nullptr, priority, nullptr);
+        if (ret != pdPASS) {
+            ESP_LOGE("Printer::init", "Can not create process task (error code %d).", ret);
+            //xQueueDelete(queue); // not supported?!
+            queue = nullptr;
+            return false;
+        }
+        return true;
+    }
+    template <typename S, typename... Args>
+    friend void print(const S& format_str, Args&&... args);
+private:
+    static void process(void*) {
+        fmt::memory_buffer* buf = nullptr;
+        for(;;) {
+            if (xQueueReceive(queue, &buf, portMAX_DELAY) == pdTRUE) {
+                if (buf == nullptr) {
+                    ESP_LOGE("Printer::process", "Received nullptr from queue.");
+                    continue;
+                }
+                Serial.write(reinterpret_cast<uint8_t*>(buf->data()), buf->size());
+                delete buf;
+            }
+        }
+    }
+    static QueueHandle_t queue;
+};
+QueueHandle_t Printer::queue = nullptr;
+
+template <typename S, typename... Args>
+inline void print(const S& format_str, Args&&... args) {
+    fmt::memory_buffer* buf = new fmt::memory_buffer;
+    fmt::format_to(*buf, format_str, args...);
+    if (xQueueSend(Printer::queue, &buf, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE("Printer::print", "Can not send message to the queue.");
+        delete buf;
+    }
+}
 
 class Pin {
 public:
@@ -210,9 +267,7 @@ const OneWire::Timing OneWire::Overdrive = {
     .J = US2TICKS( 40.0)
 };
 
-void setup() {
-    Serial.begin(115200);
-    print("OneWire sniffer\n");
+void oneWireMaster(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = 21;
     OneWire ow(Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP), Pin(onewirePin));
     for(;;) {
@@ -223,4 +278,17 @@ void setup() {
     }
 }
 
-void loop() {}
+void setup() {
+    Serial.begin(115200);
+    Printer::begin();
+    print("OneWire sniffer\n");
+    xTaskCreate(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr);
+    bootloader_random_enable();
+}
+
+HWTimer timer(TIMER_GROUP_0, TIMER_0, 40000);
+uint32_t i = 0;
+void loop() {
+    print("Nejaky nesmyslne sahodlouhy text, na kterem se ukaze, jestli je buffer dost dlouhy. Vim, ze by to chtelo aspon pul stranky textu, ale co se da delat, tolik se mi toho psat nechce. A chtelo by to v nem nejake menici se cislo, at je videt, ze to bezi\n{:5}: {:7}\n", i++, timer.value());
+    delay(random(100, 10001));
+}
