@@ -1,7 +1,10 @@
+#define LOG_LOCAL_LEVEL 5
 #include "esp_log.h"
 #include <Arduino.h>
 
 #include "driver/timer.h"
+
+#define CPUS_COUNT 2
 
 #define INTR_ATTR IRAM_ATTR
 
@@ -66,25 +69,66 @@ static inline void print(const S& format_str, Args&&... args) {
     }
 }
 
+class Callback {
+public:
+    typedef void* callback_arg_t;
+    typedef void (*callback_t)(callback_arg_t);
+    Callback(callback_t callback = nullptr, callback_arg_t arg = nullptr)
+        : m_callback(callback),
+          m_callback_arg(arg)
+    {}
+    void INTR_ATTR operator ()() { if (m_callback) m_callback(m_callback_arg); }
+private:
+    callback_t m_callback;
+    callback_arg_t m_callback_arg;
+};
+
 class Pin {
 public:
     typedef uint8_t pin_num_t;
-    typedef void* intr_callback_arg_t;
-    typedef void (*intr_callback_t)(intr_callback_arg_t);
     typedef uint8_t pin_mode_t;
     typedef int intr_mode_t;
+    typedef uint8_t Trigger;
+private:
+    typedef uint8_t interruptIndex_t;
+
+    static const interruptIndex_t NONE_INTERRUPT = 255;
     static const pin_mode_t KEEP_CURRENT = 255;
+public:
+    static const uint8_t ISR_SLOTS = GPIO_PIN_COUNT;
+private:
+    struct InterruptHandler {
+        uint64_t pinMask;
+        Callback callback;
+    };
+    struct InterruptRecord {
+        uint8_t cpu;
+        interruptIndex_t index;
+        InterruptRecord(uint8_t cpu, interruptIndex_t index)
+            : cpu(cpu),
+              index(index)
+        {}
+    };
+    
+public:   
     Pin(pin_num_t pin, pin_mode_t mode = KEEP_CURRENT, bool inverted = false)
         : m_pin(pin),
-          m_inverted(inverted)
+          m_inverted(inverted),
+          m_lock(portMUX_INITIALIZER_UNLOCKED),
+          m_interruptRecord(0, NONE_INTERRUPT)
     {
         if (mode != KEEP_CURRENT)
             pinMode(m_pin, mode);
     }
     Pin(const Pin& pin)
         : m_pin(pin.m_pin),
-          m_inverted(pin.m_inverted)
+          m_inverted(pin.m_inverted),
+          m_lock(portMUX_INITIALIZER_UNLOCKED),
+          m_interruptRecord(0, NONE_INTERRUPT)
     {}
+    ~Pin() {
+        detachInterrupt();
+    }
     void INTR_ATTR setHigh() { digitalWrite(m_pin, m_inverted ? LOW : HIGH); }
     void INTR_ATTR setLow()  { digitalWrite(m_pin, m_inverted ? HIGH : LOW); }
     void INTR_ATTR setValue(bool value) { if (value) setHigh(); else setLow(); }
@@ -92,13 +136,116 @@ public:
     void setInput(bool pullup = false) { pinMode(m_pin, INPUT | (pullup ? PULLUP : 0)); }
     void setOpenDrain(bool pullup = false) { pinMode(m_pin, OUTPUT_OPEN_DRAIN | (pullup ? PULLUP : 0)); }
     bool INTR_ATTR read() const { return (digitalRead(m_pin) == HIGH) ^ m_inverted; }
-    void attachInterrupt(intr_callback_t callback, intr_callback_arg_t arg, int mode) { attachInterruptArg(digitalPinToInterrupt(m_pin), callback, arg, mode); }
-    void detachInterrupt() { ::detachInterrupt(digitalPinToInterrupt(m_pin)); }
+    // Arduino attach interrupt crash ESP
+    //void attachInterrupt(intr_callback_t callback, intr_callback_arg_t arg, int mode) { attachInterruptArg(digitalPinToInterrupt(m_pin), callback, arg, mode); }
+    //void detachInterrupt() { ::detachInterrupt(digitalPinToInterrupt(m_pin)); }
+    void attachInterrupt(Callback::callback_t callback, Callback::callback_arg_t arg, Trigger mode) {
+        portENTER_CRITICAL(&s_lock);
+        uint8_t cpu = xPortGetCoreID();
+        esp_intr_disable(s_interruptHandle[cpu]);
+        if (m_interruptRecord.index != NONE_INTERRUPT) {
+            if (cpu != m_interruptRecord.cpu) {
+                _enableInterruptOnCpu(false, m_interruptRecord.cpu);
+                esp_intr_disable(s_interruptHandle[m_interruptRecord.cpu]);
+                s_interruptHandler[m_interruptRecord.cpu][m_interruptRecord.index].pinMask = 0;
+                esp_intr_enable(s_interruptHandle[m_interruptRecord.cpu]);
+            }
+        } else {
+            for (uint8_t i = 0; i != ISR_SLOTS; ++i) {
+                if (s_interruptHandler[m_interruptRecord.cpu][i].pinMask == 0) {
+                    m_interruptRecord.index = i;
+                    break;
+                }
+            }
+        }
+        m_interruptRecord.cpu = cpu;
+        if (m_interruptRecord.index == NONE_INTERRUPT) {
+            ESP_LOGE("Pin::attachIntr", "No available slot.");
+        } else {
+            s_interruptHandler[m_interruptRecord.cpu][m_interruptRecord.index].callback = Callback(callback, arg);
+            s_interruptHandler[m_interruptRecord.cpu][m_interruptRecord.index].pinMask = (1ULL<<m_pin);
+            interruptTrigger(mode);
+            _enableInterruptOnCpu(true, m_interruptRecord.cpu);
+        }
+        esp_intr_enable(s_interruptHandle[m_interruptRecord.cpu]);
+        portEXIT_CRITICAL(&s_lock);
+    }
+    void detachInterrupt() {
+        portENTER_CRITICAL(&s_lock);
+        if (m_interruptRecord.index != NONE_INTERRUPT) {
+            _enableInterruptOnCpu(false, m_interruptRecord.cpu);
+            esp_intr_disable(s_interruptHandle[m_interruptRecord.cpu]);
+            s_interruptHandler[m_interruptRecord.cpu][m_interruptRecord.index].pinMask = 0;
+            m_interruptRecord.index = NONE_INTERRUPT;
+            esp_intr_enable(s_interruptHandle[m_interruptRecord.cpu]);
+        }
+        portEXIT_CRITICAL(&s_lock);
+    }
+    void INTR_ATTR interruptTrigger(Trigger trigger) {
+        GPIO.pin[m_pin].int_type = trigger;
+    }
     pin_num_t pin() const { return m_pin; }
+
+    static void initInterrupts() {
+        for (uint8_t i = 0; i != CPUS_COUNT; ++i) {
+            std::string taskName = fmt::format("Pin:initIntr{}",i);
+            xTaskCreatePinnedToCore(Pin::initWorker, taskName.c_str(), 2*1024, xTaskGetCurrentTaskHandle(), 4, nullptr, i);
+            ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+        }
+    }
 private:
+    void _enableInterruptOnCpu(bool en, uint8_t cpu) {
+        switch (cpu) {
+            case 0: GPIO.pin[m_pin].int_ena = (GPIO.pin[m_pin].int_ena & ~GPIO_PRO_CPU_INTR_ENA) | (en ? GPIO_PRO_CPU_INTR_ENA : 0); break;
+            case 1: GPIO.pin[m_pin].int_ena = (GPIO.pin[m_pin].int_ena & ~GPIO_APP_CPU_INTR_ENA) | (en ? GPIO_APP_CPU_INTR_ENA : 0); break;
+            default:
+                ESP_LOGE("Pin::enIntr", "ESP32 has no core %d.\n", cpu);
+                break;
+        }
+
+    }
+
     const pin_num_t m_pin;
     const bool m_inverted;
+    portMUX_TYPE m_lock;
+    InterruptRecord m_interruptRecord;
+
+    static void INTR_ATTR ISR(void* args) {
+        uint32_t gpio_intr_status_l = GPIO.status;
+        uint32_t gpio_intr_status_h = GPIO.status1.val;
+        GPIO.status_w1tc = gpio_intr_status_l;
+        GPIO.status1_w1tc.val = gpio_intr_status_h;
+        uint8_t cpu = intptr_t(args);
+        uint64_t status = (uint64_t(gpio_intr_status_h) << 8) | gpio_intr_status_l;
+        for (uint8_t i = 0; i != ISR_SLOTS; ++i)
+            if ((status & s_interruptHandler[cpu][i].pinMask) != 0)
+                s_interruptHandler[cpu][i].callback();
+    }
+
+    static void initWorker(void* args) {
+        uint8_t cpu = xPortGetCoreID();
+        if (s_interruptHandle[cpu] == nullptr) {
+            esp_err_t ret = esp_intr_alloc(ETS_GPIO_INTR_SOURCE, (int)ESP_INTR_FLAG_IRAM, Pin::ISR, reinterpret_cast<void*>(cpu), &s_interruptHandle[cpu]);
+            switch (ret) {
+            case ESP_OK: break;
+            case ESP_ERR_INVALID_ARG: ESP_LOGE("Pin::InitWorker", "Invalid combination of esp_intr_alloc arguments on cpu %d, strange.", cpu); break;
+            case ESP_ERR_NOT_FOUND: ESP_LOGE("Pin::InitWorker", "No available interrupt slot on cpu %d.", cpu); break;
+            default: ESP_LOGE("Pin::InitWorker", "esp_intr_alloc failed with code %d on cpu %d, strange.", uint32_t(ret), cpu); break;
+            }
+        } else {
+            ESP_LOGW("Pin::InitWorker", "Interrupt already initialised on cpu %d.", cpu);
+        }
+        xTaskNotifyGive(args);
+        vTaskDelete(nullptr);
+    }
+
+    static portMUX_TYPE s_lock;
+    static InterruptHandler s_interruptHandler[CPUS_COUNT][ISR_SLOTS];
+    static intr_handle_t s_interruptHandle[CPUS_COUNT];
 };
+portMUX_TYPE Pin::s_lock = portMUX_INITIALIZER_UNLOCKED;
+Pin::InterruptHandler Pin::s_interruptHandler[CPUS_COUNT][Pin::ISR_SLOTS] = { 0 };
+intr_handle_t Pin::s_interruptHandle[CPUS_COUNT] = { nullptr };
 
 class HWTimer {
 public:
@@ -272,20 +419,6 @@ private:
 	{
 		return index_type(ptr - base) % Capacity;
 	}
-};
-
-class Callback {
-public:
-    typedef void* callback_arg_t;
-    typedef void (*callback_t)(callback_arg_t);
-    Callback(callback_t callback = nullptr, callback_arg_t arg = nullptr)
-        : m_callback(callback),
-          m_callback_arg(arg)
-    {}
-    void INTR_ATTR operator ()() { if (m_callback) m_callback(m_callback_arg); }
-private:
-    callback_t m_callback;
-    callback_arg_t m_callback_arg;
 };
 
 class OneWire {
@@ -465,7 +598,7 @@ static void oneWireMaster(void* args = nullptr) {
     for(;;) {
         //bool presence = ow.reset();
         print("write 0x{:02X}\n", v);
-        ow.write(v);
+        ow.write(v++);
         //print("presence: {}\n", presence);
         delay(1000);
     }
@@ -492,12 +625,69 @@ static void oneWireSlave(void* args = nullptr) {
     }
 }
 
+static void testTask(void* args = nullptr) {
+    Pin pin(0, INPUT_PULLUP);
+    pin.attachInterrupt(notifyTaskFromISR, xTaskGetCurrentTaskHandle(), FALLING);
+    for(;;) {
+        uint32_t v = ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(500));
+        print("v = {}, pin = {}\n", v, pin.read());
+    }
+}
+
+inline static void checkReset() {
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    switch (resetReason) {
+    case ESP_RST_UNKNOWN:
+        print("\tUnknown reset - strange\n");
+        break;
+    case ESP_RST_POWERON:
+        print("\tPoweron reset\n");
+        break;
+    case ESP_RST_EXT:
+        print("\tExternal reset\n");
+        break;
+    case ESP_RST_SW:
+        print("\tSoftware reset\n");
+        break;
+    case ESP_RST_PANIC:
+        print("\tReset due to core panic - stop program\n");
+        vTaskSuspend(nullptr);
+        break;
+    case ESP_RST_INT_WDT:
+        print("\tReset due to interrupt watchdog - stop program\n");
+        vTaskSuspend(nullptr);
+        break;
+    case ESP_RST_TASK_WDT:
+        print("\tReset due to task watchdog - stop program\n");
+        vTaskSuspend(nullptr);
+        break;
+    case ESP_RST_WDT:
+        print("\tReset due to some watchdog - stop program\n");
+        vTaskSuspend(nullptr);
+        break;
+    case ESP_RST_DEEPSLEEP:
+        print("\tWaked from deep sleep\n");
+        break;
+    case ESP_RST_BROWNOUT:
+        print("\tBrownout reset - please check power\n");
+        break;
+    case ESP_RST_SDIO:
+        print("\tSDIO reset - strange\n");
+        break;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     Printer::begin();
     print("OneWire sniffer\n");
-    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 2*1024, nullptr, 4, nullptr, 1);
+    checkReset();
+
+    Pin::initInterrupts();
+
+    //xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr, 0);
+    //xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 2*1024, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(testTask , "testTask" , 2*1024, nullptr, 4, nullptr, 1);
 }
 
 void loop() {}
