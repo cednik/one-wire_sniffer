@@ -298,8 +298,8 @@ public:
         //     plus slave timing - see StandardTiming definition below
         time_t A,B,C,D,E,F,G,H,I,J,K;
     };
-    static const Timing StandardTiming;
-    static const Timing OverdriveTiming;
+    static const DRAM_ATTR Timing StandardTiming;
+    static const DRAM_ATTR Timing OverdriveTiming;
     OneWire(Pin input,
             Pin output,
             Pin boost = Pin(DUMMY_PIN),
@@ -397,6 +397,7 @@ private:
     volatile uint8_t m_receivingByte;
     Buffer<uint8_t, 64> m_buffer;
     Callback m_onReceive;
+
     static void INTR_ATTR pinISR(void* args) {
         OneWire* self = reinterpret_cast<OneWire*>(args);
         switch (self->m_state) {
@@ -430,7 +431,7 @@ private:
 #define US2TICKS(us) OneWire::Timing::time_t(us * 240)
 // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
 //     plus slave timing
-const OneWire::Timing OneWire::StandardTiming = {
+const DRAM_ATTR OneWire::Timing OneWire::StandardTiming = {
     .A = US2TICKS(  6), // master write zero first
     .B = US2TICKS( 64), // master write zero second
     .C = US2TICKS( 60), // master write one first
@@ -443,7 +444,7 @@ const OneWire::Timing OneWire::StandardTiming = {
     .J = US2TICKS(410), // master reset pause
     .K = US2TICKS( 35)  // slave read sample
 };
-const OneWire::Timing OneWire::OverdriveTiming = {
+const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = {
     .A = US2TICKS(  1.0),
     .B = US2TICKS(  7.5),
     .C = US2TICKS(  7.5),
