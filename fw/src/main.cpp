@@ -18,7 +18,7 @@
 template <typename S, typename... Args>
 static inline void print(const S& format_str, Args&&... args);
 
-class Printer { // constide use of MessageBuffer, instead of queue
+class Printer { // consider use of MessageBuffer, instead of queue
 public:
     static bool begin(size_t queueSize = 128, uint32_t stackSize = 1024, UBaseType_t priority = 4) {
         if (queue != nullptr) {
@@ -30,10 +30,19 @@ public:
             ESP_LOGE("Printer::init", "Can not create queue.");
             return false;
         }
+        mutex = xSemaphoreCreateRecursiveMutex();
+        if (mutex == nullptr) {
+            ESP_LOGE("Printer::init", "Can not create mutex.");
+            vQueueDelete(queue);
+            queue = nullptr;
+            return false;
+        }
         BaseType_t ret = xTaskCreate(process, "Printer::process", stackSize, nullptr, priority, nullptr);
         if (ret != pdPASS) {
             ESP_LOGE("Printer::init", "Can not create process task (error code %d).", ret);
-            //xQueueDelete(queue); // not supported?!
+            vSemaphoreDelete(mutex);
+            vQueueDelete(queue);
+            mutex = nullptr;
             queue = nullptr;
             return false;
         }
@@ -41,6 +50,12 @@ public:
     }
     template <typename S, typename... Args>
     friend void print(const S& format_str, Args&&... args);
+    static bool acquire(TickType_t timeout = portMAX_DELAY) {
+        return xSemaphoreTakeRecursive(mutex, timeout) == pdTRUE;
+    }
+    static bool release() {
+        return xSemaphoreGiveRecursive(mutex) == pdTRUE;
+    }
 private:
     static void process(void*) {
         fmt::memory_buffer* buf = nullptr;
@@ -56,17 +71,21 @@ private:
         }
     }
     static QueueHandle_t queue;
+    static SemaphoreHandle_t mutex;
 };
 QueueHandle_t Printer::queue = nullptr;
+SemaphoreHandle_t Printer::mutex = nullptr;
 
 template <typename S, typename... Args>
 static inline void print(const S& format_str, Args&&... args) {
+    Printer::acquire();
     fmt::memory_buffer* buf = new fmt::memory_buffer;
     fmt::format_to(*buf, format_str, args...);
     if (xQueueSend(Printer::queue, &buf, portMAX_DELAY) != pdTRUE) {
         ESP_LOGE("Printer::print", "Can not send message to the queue.");
         delete buf;
     }
+    Printer::release();
 }
 
 class Callback {
@@ -78,10 +97,62 @@ public:
           m_callback_arg(arg)
     {}
     void INTR_ATTR operator ()() { if (m_callback) m_callback(m_callback_arg); }
+    const callback_t& getCallback() const { return m_callback; }
+    const callback_arg_t& getArg() const { return m_callback_arg; }
 private:
     callback_t m_callback;
     callback_arg_t m_callback_arg;
 };
+
+class testQueue {
+    uint64_t _status;
+    uint8_t _cpu;
+    void _print() {
+        ::print("{:8} Interrupt on cpu {}: {:016X}\n", s_index++, _cpu, _status);
+    }
+    void INTR_ATTR _init(uint8_t cpu, uint64_t status) {
+        _cpu = cpu;
+        _status = status;
+    }
+    testQueue(){}
+    ~testQueue(){}
+public:
+    static void init(size_t capacity = 128) {
+        if (s_handle == nullptr) {
+            s_handle = xQueueCreate(capacity, sizeof(testQueue));
+            if (s_handle == nullptr) {
+                ESP_LOGE("TestQueue:init", "Can not allocate queue.");
+            }
+        } else {
+            ESP_LOGW("TestQueue:init", "Queue already initialised.");
+        }
+    }
+    template<typename... Args>
+    static void send(Args&&... args) {
+        testQueue item;
+        item._init(args...);
+        xQueueSend(s_handle, &item, 0);
+    }
+    template<typename... Args>
+    static void INTR_ATTR sendFromISR(Args&&... args) {
+        testQueue item;
+        item._init(args...);
+        xQueueSendFromISR(s_handle, &item, 0);
+    }
+    static void print() {
+        testQueue item;
+        if (xQueueReceive(s_handle, &item, portMAX_DELAY) == pdTRUE)
+            item._print();
+    }
+private:
+    static QueueHandle_t s_handle;
+    static volatile uint32_t s_index;
+};
+QueueHandle_t testQueue::s_handle = nullptr;
+volatile uint32_t testQueue::s_index = 0;
+
+#undef GPIO_PRO_CPU_INTR_ENA
+#define GPIO_PRO_CPU_INTR_ENA (BIT(3)) // Errornously defined as (BIT(2)) in arduino-esp32
 
 class Pin {
 public:
@@ -137,7 +208,7 @@ public:
     void setOpenDrain(bool pullup = false) { pinMode(m_pin, OUTPUT_OPEN_DRAIN | (pullup ? PULLUP : 0)); }
     bool INTR_ATTR read() const { return (digitalRead(m_pin) == HIGH) ^ m_inverted; }
     // Arduino attach interrupt crash ESP
-    //void attachInterrupt(intr_callback_t callback, intr_callback_arg_t arg, int mode) { attachInterruptArg(digitalPinToInterrupt(m_pin), callback, arg, mode); }
+    //void attachInterrupt(Callback::callback_t callback, Callback::callback_arg_t arg, int mode) { attachInterruptArg(digitalPinToInterrupt(m_pin), callback, arg, mode); }
     //void detachInterrupt() { ::detachInterrupt(digitalPinToInterrupt(m_pin)); }
     void attachInterrupt(Callback::callback_t callback, Callback::callback_arg_t arg, Trigger mode) {
         portENTER_CRITICAL(&s_lock);
@@ -152,7 +223,7 @@ public:
             }
         } else {
             for (uint8_t i = 0; i != ISR_SLOTS; ++i) {
-                if (s_interruptHandler[m_interruptRecord.cpu][i].pinMask == 0) {
+                if (s_interruptHandler[cpu][i].pinMask == 0) {
                     m_interruptRecord.index = i;
                     break;
                 }
@@ -193,7 +264,44 @@ public:
             ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
         }
     }
+    static void printInterrupts() {
+        Printer::acquire();
+        portENTER_CRITICAL(&s_lock);
+        print("Registered interrupts\n");
+        for (uint8_t cpu = 0; cpu != CPUS_COUNT; ++cpu) {
+            _printInterruptSlots(cpu);
+        }
+        _printPinsInterruptSettings();
+        portEXIT_CRITICAL(&s_lock);
+        Printer::release();
+    }
 private:
+    static void _printInterruptSlots(uint8_t cpu, uint8_t first = 0, uint8_t last = ISR_SLOTS) {
+        print("\tCPU {}\n", cpu);
+            print("\t\tslot       mask           fcn          arg\n", cpu);
+            for (uint8_t slot = first; slot != last; ++slot) {
+                InterruptHandler& rec = s_interruptHandler[cpu][slot];
+                if (rec.pinMask || rec.callback.getCallback() || rec.callback.getArg())
+                    print("\t\t{:4} {:016X} {:08X} {:08X}\n", slot, rec.pinMask, uintptr_t(rec.callback.getCallback()), uintptr_t(rec.callback.getArg()));
+            }
+    }
+    static void _printPinsInterruptSettings(uint8_t first = 0, uint8_t last = GPIO_PIN_COUNT) {
+        print("\n\tpin enable(PRO_NM, PRO, -, APP_NM, APP), type\n");
+        for(uint8_t i = first; i != last; ++i) {
+            std::string type;
+            switch (GPIO.pin[i].int_type) {
+                case  0: type = "disabled"; break;
+                case  1: type = "rising"; break;
+                case  2: type = "falling"; break;
+                case  3: type = "both"; break;
+                case  4: type = "low"; break;
+                case  5: type = "high"; break;
+                default: type = fmt::format("unknown {:02x}", uint8_t(GPIO.pin[i].int_type)); break;
+            }
+            if (GPIO.pin[i].int_ena || GPIO.pin[i].int_type)
+                print("\t{:3} {:05b} {}\n", i, uint8_t(GPIO.pin[i].int_ena), type);
+        }
+    }
     void _enableInterruptOnCpu(bool en, uint8_t cpu) {
         switch (cpu) {
             case 0: GPIO.pin[m_pin].int_ena = (GPIO.pin[m_pin].int_ena & ~GPIO_PRO_CPU_INTR_ENA) | (en ? GPIO_PRO_CPU_INTR_ENA : 0); break;
@@ -216,7 +324,7 @@ private:
         GPIO.status_w1tc = gpio_intr_status_l;
         GPIO.status1_w1tc.val = gpio_intr_status_h;
         uint8_t cpu = intptr_t(args);
-        uint64_t status = (uint64_t(gpio_intr_status_h) << 8) | gpio_intr_status_l;
+        uint64_t status = (uint64_t(gpio_intr_status_h) << 32) | gpio_intr_status_l;
         for (uint8_t i = 0; i != ISR_SLOTS; ++i)
             if ((status & s_interruptHandler[cpu][i].pinMask) != 0)
                 s_interruptHandler[cpu][i].callback();
@@ -449,6 +557,9 @@ public:
           m_buffer(),
           m_onReceive(onReceive)
     {
+        m_input.setHigh();
+        m_output.setHigh();
+        m_boost.setLow();
         becomeSlave();
     }
 
@@ -525,7 +636,7 @@ private:
     Pin m_boost;
     const Timing* m_timing;
     portMUX_TYPE m_lock;
-    State m_state;
+    volatile State m_state;
     volatile uint8_t m_bitIndex;
     volatile uint8_t m_receivingByte;
     Buffer<uint8_t, 64> m_buffer;
@@ -537,8 +648,11 @@ private:
         case MASTER:
             break;
         case READ:
+            self->m_boost.setHigh();
             wait<Timer>(self->m_timing->K);
-            self->m_receivingByte = (self->m_receivingByte << 1) | self->m_input.read();
+            self->m_receivingByte >>= 1;
+            self->m_receivingByte |= self->m_input.read() ? 0x80 : 0x00;
+            self->m_boost.setLow();
             if (++self->m_bitIndex == 8) {
                 self->m_buffer.push(self->m_receivingByte);
                 self->m_receivingByte = 0;
@@ -561,21 +675,22 @@ private:
         }
     }
 };
-#define US2TICKS(us) OneWire::Timing::time_t(us * 240)
+#define US2TICKS(us) OneWire::Timing::time_t((us) * 240)
 // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
 //     plus slave timing
+//     - ESP32 processing offset
 const DRAM_ATTR OneWire::Timing OneWire::StandardTiming = {
-    .A = US2TICKS(  6), // master write zero first
-    .B = US2TICKS( 64), // master write zero second
-    .C = US2TICKS( 60), // master write one first
-    .D = US2TICKS( 10), // master write one first
-    .E = US2TICKS(  9), // master read sample
-    .F = US2TICKS( 55), // master read pause
-    .G = US2TICKS(  0), // master reset before
-    .H = US2TICKS(480), // master reset low
-    .I = US2TICKS( 70), // master reset sample
-    .J = US2TICKS(410), // master reset pause
-    .K = US2TICKS( 35)  // slave read sample
+    .A = US2TICKS(  6 - 0.0), // master write zero first
+    .B = US2TICKS( 64 - 0.0), // master write zero second
+    .C = US2TICKS( 60 - 0.0), // master write one first
+    .D = US2TICKS( 10 - 0.0), // master write one first
+    .E = US2TICKS(  9 - 0.0), // master read sample
+    .F = US2TICKS( 55 - 0.0), // master read pause
+    .G = US2TICKS(  0 - 0.0), // master reset before
+    .H = US2TICKS(480 - 0.0), // master reset low
+    .I = US2TICKS( 70 - 0.0), // master reset sample
+    .J = US2TICKS(410 - 0.0), // master reset pause
+    .K = US2TICKS( 35 - 2.5)  // slave read sample
 };
 const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = {
     .A = US2TICKS(  1.0),
@@ -591,9 +706,17 @@ const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = {
     .K = US2TICKS(  4.5)
 };
 
+static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR( reinterpret_cast<TaskHandle_t>(args), &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken == pdTRUE)
+        portYIELD_FROM_ISR();
+}
+
 static void oneWireMaster(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_MASTER_PIN;
     OneWire ow(Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP), Pin(onewirePin));
+    ow.becomeMaster();
     uint8_t v = 0xAA;
     for(;;) {
         //bool presence = ow.reset();
@@ -604,33 +727,17 @@ static void oneWireMaster(void* args = nullptr) {
     }
 }
 
-static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR( reinterpret_cast<TaskHandle_t>(args), &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken == pdTRUE)
-        portYIELD_FROM_ISR();
-}
-
 static void oneWireSlave(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_SLAVE_PIN;
     OneWire ow(
         Pin(onewirePin,OUTPUT_OPEN_DRAIN | PULLUP),
         Pin(onewirePin),
-        Pin(DUMMY_PIN),
+        Pin(21, OUTPUT),
         &OneWire::StandardTiming,
         Callback(notifyTaskFromISR, xTaskGetCurrentTaskHandle()) );
     for(;;) {
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        print("OneWireSlave:receive {:02X}\n", ow.read());
-    }
-}
-
-static void testTask(void* args = nullptr) {
-    Pin pin(0, INPUT_PULLUP);
-    pin.attachInterrupt(notifyTaskFromISR, xTaskGetCurrentTaskHandle(), FALLING);
-    for(;;) {
-        uint32_t v = ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(500));
-        print("v = {}, pin = {}\n", v, pin.read());
+        print("OneWireSlave:receive 0x{:02X}\n", ow.read());
     }
 }
 
@@ -683,11 +790,15 @@ void setup() {
     print("OneWire sniffer\n");
     checkReset();
 
+    testQueue::init();
+
     Pin::initInterrupts();
 
-    //xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr, 0);
-    //xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 2*1024, nullptr, 4, nullptr, 1);
-    xTaskCreatePinnedToCore(testTask , "testTask" , 2*1024, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr, 0);
+    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 2*1024, nullptr, 4, nullptr, 1);
+    delay(500);
 }
 
-void loop() {}
+void loop() {
+    testQueue::print();
+}
