@@ -206,7 +206,7 @@ public:
     void setOutput() { pinMode(m_pin, OUTPUT); }
     void setInput(bool pullup = false) { pinMode(m_pin, INPUT | (pullup ? PULLUP : 0)); }
     void setOpenDrain(bool pullup = false) { pinMode(m_pin, OUTPUT_OPEN_DRAIN | (pullup ? PULLUP : 0)); }
-    bool INTR_ATTR read() const { return (digitalRead(m_pin) == HIGH) ^ m_inverted; }
+    bool INTR_ATTR read() const { return digitalRead(m_pin) ^ m_inverted; }
     // Arduino attach interrupt crash ESP
     //void attachInterrupt(Callback::callback_t callback, Callback::callback_arg_t arg, int mode) { attachInterruptArg(digitalPinToInterrupt(m_pin), callback, arg, mode); }
     //void detachInterrupt() { ::detachInterrupt(digitalPinToInterrupt(m_pin)); }
@@ -254,6 +254,12 @@ public:
     }
     void INTR_ATTR interruptTrigger(Trigger trigger) {
         GPIO.pin[m_pin].int_type = trigger;
+    }
+    void INTR_ATTR clearInterruptFlag() {
+        if (m_pin < 32)
+            GPIO.status_w1tc = 1<<m_pin;
+        else
+            GPIO.status1_w1tc.val = 1<<(m_pin-32);
     }
     pin_num_t pin() const { return m_pin; }
 
@@ -318,17 +324,7 @@ private:
     portMUX_TYPE m_lock;
     InterruptRecord m_interruptRecord;
 
-    static void INTR_ATTR ISR(void* args) {
-        uint32_t gpio_intr_status_l = GPIO.status;
-        uint32_t gpio_intr_status_h = GPIO.status1.val;
-        GPIO.status_w1tc = gpio_intr_status_l;
-        GPIO.status1_w1tc.val = gpio_intr_status_h;
-        uint8_t cpu = intptr_t(args);
-        uint64_t status = (uint64_t(gpio_intr_status_h) << 32) | gpio_intr_status_l;
-        for (uint8_t i = 0; i != ISR_SLOTS; ++i)
-            if ((status & s_interruptHandler[cpu][i].pinMask) != 0)
-                s_interruptHandler[cpu][i].callback();
-    }
+    static void INTR_ATTR ISR(void* args);
 
     static void initWorker(void* args) {
         uint8_t cpu = xPortGetCoreID();
@@ -354,6 +350,25 @@ private:
 portMUX_TYPE Pin::s_lock = portMUX_INITIALIZER_UNLOCKED;
 Pin::InterruptHandler Pin::s_interruptHandler[CPUS_COUNT][Pin::ISR_SLOTS] = { 0 };
 intr_handle_t Pin::s_interruptHandle[CPUS_COUNT] = { nullptr };
+
+Pin isrOut(19, OUTPUT);
+
+void INTR_ATTR Pin::ISR(void* args) {
+        isrOut.setHigh();
+        uint32_t gpio_intr_status_l = GPIO.status;
+        uint32_t gpio_intr_status_h = GPIO.status1.val;
+        GPIO.status_w1tc = gpio_intr_status_l;
+        GPIO.status1_w1tc.val = gpio_intr_status_h;
+        uint8_t cpu = intptr_t(args);
+        uint64_t status = (uint64_t(gpio_intr_status_h) << 32) | gpio_intr_status_l;
+        for (uint8_t i = 0; i != ISR_SLOTS; ++i) {
+            if ((status & s_interruptHandler[cpu][i].pinMask) != 0) {
+                s_interruptHandler[cpu][i].callback();
+                //break;
+            }
+        }
+        isrOut.setLow();
+    }
 
 class HWTimer {
 public:
@@ -418,9 +433,11 @@ public:
 };
 
 template <class Timer>
-static void INTR_ATTR wait(typename Timer::value_t t) {
-    t += Timer::value();
+static typename Timer::value_t INTR_ATTR wait(typename Timer::value_t t) {
+    const typename Timer::value_t tStart = Timer::value();
+    t += tStart;
     while(Timer::value() < t);
+    return tStart;
 }
 
 template <typename T, size_t Capacity>
@@ -531,31 +548,38 @@ private:
 
 class OneWire {
     typedef fastestTimer Timer;
-    enum State { MASTER, READ, WRITE, SCANNED, WAIT };
+    enum class State: uint8_t { MASTER, CHECK_RESET, READ, WRITE, SCANNED, WAIT };
 public:
     struct Timing {
         typedef Timer::value_t time_t; // in CPU ticks -> 1 / 240 MHz
         // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
         //     plus slave timing - see StandardTiming definition below
-        time_t A,B,C,D,E,F,G,H,I,J,K;
+        time_t A,B,C,D,E,F,G,H,I,J,K,L,M;
     };
     static const DRAM_ATTR Timing StandardTiming;
     static const DRAM_ATTR Timing OverdriveTiming;
+    struct event_t {
+        enum class type_t: uint8_t { RECEIVED, RESET };
+        typedef uint8_t value_t;
+        type_t type;
+        value_t value;
+        void INTR_ATTR operator =(volatile event_t& e) volatile { type = e.type; value = e.value; }
+    };
     OneWire(Pin input,
             Pin output,
             Pin boost = Pin(DUMMY_PIN),
             const Timing* timing = &StandardTiming,
-            Callback onReceive = Callback())
+            Callback onEvent = Callback())
         : m_input(input),
           m_output(output),
           m_boost(boost),
           m_timing(timing),
           m_lock(portMUX_INITIALIZER_UNLOCKED),
-          m_state(MASTER),
+          m_state(State::MASTER),
           m_bitIndex(0),
           m_receivingByte(0),
           m_buffer(),
-          m_onReceive(onReceive)
+          m_onEvent(onEvent)
     {
         m_input.setHigh();
         m_output.setHigh();
@@ -564,17 +588,17 @@ public:
     }
 
     void becomeMaster() {
-        if (m_state == MASTER)
+        if (m_state == State::MASTER)
             return;
         m_input.detachInterrupt();
         m_buffer.clear();
-        m_state = MASTER;
+        m_state = State::MASTER;
     }
 
     void becomeSlave() {
-        if (m_state != MASTER)
+        if (m_state != State::MASTER)
             return;
-        m_state = READ;
+        m_state = State::READ;
         m_input.attachInterrupt(pinISR, this, FALLING);
     }
 
@@ -597,16 +621,17 @@ public:
     }
     uint8_t read() {
         uint8_t v = 0;
-        if (m_state == MASTER) {
+        if (m_state == State::MASTER) {
             for(uint8_t i = 0; i != 8; ++i) {
                 v |= _readBit();
                 v <<= 1;
             }
-        } else {
-            m_buffer.try_pop(v);
         }
         return v;
     }
+    event_t::type_t getLastEventType() const { return m_buffer.top_ref().type; }
+    event_t::value_t getLastEventValue() const { return m_buffer.top_ref().value; }
+    void popEvent() { m_buffer.pop(); }
 
 private:
     void _writeBit(const bool v) {
@@ -631,6 +656,64 @@ private:
         return v;
     }
 
+    void INTR_ATTR _pinISR() {
+        m_boost.setHigh();
+        switch (m_state) {
+        case State::MASTER:
+            break;
+        case State::CHECK_RESET:
+            if ((Timer::value() - m_edgeTime) > m_timing->H) {
+                wait<Timer>(m_timing->L);
+                m_output.setLow();
+                wait<Timer>(m_timing->M);
+                m_output.setHigh();
+                m_receivingByte = 0;
+                m_bitIndex = 0;
+                _createEvent(event_t::type_t::RESET, 0);
+            }
+            m_state = State::READ;
+            m_input.clearInterruptFlag();
+            m_input.interruptTrigger(FALLING);
+            break;
+        case State::READ:
+            m_edgeTime = wait<Timer>(m_timing->K);
+            m_receivingByte >>= 1;
+            if (m_input.read()) {
+                m_receivingByte |= 0x80;
+            } else {
+                m_state = State::CHECK_RESET;
+                m_input.interruptTrigger(RISING);
+            }
+            if (++m_bitIndex == 8) {
+                _createEvent(event_t::type_t::RECEIVED, m_receivingByte);
+                m_receivingByte = 0;
+                m_bitIndex = 0;
+            }
+            break;
+        case State::WRITE:
+            m_output.setValue(m_buffer.top_ref().value & (1<<m_bitIndex));
+            if (++m_bitIndex == 8) {
+                if (!m_buffer.empty())
+                    m_buffer.pop();
+                m_bitIndex = 0;
+            }
+            break;
+        case State::SCANNED:
+            break;
+        case State::WAIT:
+            break;
+        }
+        m_boost.setLow();
+    }
+
+    void INTR_ATTR _createEvent(event_t::type_t type, event_t::value_t value) {
+        event_t e;
+        e.type = type;
+        e.value = value;
+        m_buffer.push(e);
+        m_onEvent();
+    }
+
     Pin m_input;
     Pin m_output;
     Pin m_boost;
@@ -639,41 +722,14 @@ private:
     volatile State m_state;
     volatile uint8_t m_bitIndex;
     volatile uint8_t m_receivingByte;
-    Buffer<uint8_t, 64> m_buffer;
-    Callback m_onReceive;
+    volatile Timer::value_t m_edgeTime;
+    Buffer<event_t, 64> m_buffer;
+    Callback m_onEvent;
 
     static void INTR_ATTR pinISR(void* args) {
-        OneWire* self = reinterpret_cast<OneWire*>(args);
-        switch (self->m_state) {
-        case MASTER:
-            break;
-        case READ:
-            self->m_boost.setHigh();
-            wait<Timer>(self->m_timing->K);
-            self->m_receivingByte >>= 1;
-            self->m_receivingByte |= self->m_input.read() ? 0x80 : 0x00;
-            self->m_boost.setLow();
-            if (++self->m_bitIndex == 8) {
-                self->m_buffer.push(self->m_receivingByte);
-                self->m_receivingByte = 0;
-                self->m_bitIndex = 0;
-                self->m_onReceive();
-            }
-            break;
-        case WRITE:
-            self->m_output.setValue(self->m_buffer.top() & (1<<self->m_bitIndex));
-            if (++self->m_bitIndex == 8) {
-                if (!self->m_buffer.empty())
-                    self->m_buffer.pop();
-                self->m_bitIndex = 0;
-            }
-            break;
-        case SCANNED:
-            break;
-        case WAIT:
-            break;
-        }
+        reinterpret_cast<OneWire*>(args)->_pinISR();
     }
+        
 };
 #define US2TICKS(us) OneWire::Timing::time_t((us) * 240)
 // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
@@ -690,9 +746,11 @@ const DRAM_ATTR OneWire::Timing OneWire::StandardTiming = {
     .H = US2TICKS(480 - 0.0), // master reset low
     .I = US2TICKS( 70 - 0.0), // master reset sample
     .J = US2TICKS(410 - 0.0), // master reset pause
-    .K = US2TICKS( 35 - 2.5)  // slave read sample
+    .K = US2TICKS( 35 - 2.5), // slave read sample
+    .L = US2TICKS( 35 - 0.0), // slave presence responce
+    .M = US2TICKS( 70 - 0.0)  // slave presence release
 };
-const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = {
+const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = { // Too fast for ESP32
     .A = US2TICKS(  1.0),
     .B = US2TICKS(  7.5),
     .C = US2TICKS(  7.5),
@@ -703,7 +761,9 @@ const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = {
     .H = US2TICKS( 70.0),
     .I = US2TICKS(  8.5),
     .J = US2TICKS( 40.0),
-    .K = US2TICKS(  4.5)
+    .K = US2TICKS(  4.5),
+    .L = US2TICKS(  4.5),
+    .M = US2TICKS(  8.5)
 };
 
 static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
@@ -718,12 +778,36 @@ static void oneWireMaster(void* args = nullptr) {
     OneWire ow(Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP), Pin(onewirePin));
     ow.becomeMaster();
     uint8_t v = 0xAA;
-    for(;;) {
+    for(;0;) {
         //bool presence = ow.reset();
         print("write 0x{:02X}\n", v);
         ow.write(v++);
+        if (v % 4 == 0) {
+            print("reset\n");
+            ow.reset();
+            delay(1000);    
+        }
         //print("presence: {}\n", presence);
         delay(1000);
+    }
+    for(;;) {
+        if (Serial.available()) {
+            char c = Serial.read();
+            switch(c) {
+            case '\r':
+                print("\n");
+                break;
+            case 'R':
+                print("reset: {} device available\n", ow.reset() ? "any" : "no");
+                break;
+            default:
+                print("write 0x{:02X}\n", c);
+                ow.write(c);
+                break;
+            }
+        } else {
+            delay(100);
+        }
     }
 }
 
@@ -737,7 +821,23 @@ static void oneWireSlave(void* args = nullptr) {
         Callback(notifyTaskFromISR, xTaskGetCurrentTaskHandle()) );
     for(;;) {
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        print("OneWireSlave:receive 0x{:02X}\n", ow.read());
+        OneWire::event_t::type_t eventType = ow.getLastEventType();
+        OneWire::event_t::value_t eventValue = ow.getLastEventValue();
+        ow.popEvent();
+        Printer::acquire();
+        print("OneWireSlave:");
+        switch(eventType) {
+        case OneWire::event_t::type_t::RECEIVED:
+            print("receive 0x{:02X}\n", eventValue);
+            break;
+        case OneWire::event_t::type_t::RESET:
+            print("reset\n");
+            break;
+        default:
+            print("unknown 0x{:02X}\n", uint8_t(eventType));
+            break;
+        }
+        Printer::release();
     }
 }
 
