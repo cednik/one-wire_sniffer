@@ -1,10 +1,12 @@
 #define LOG_LOCAL_LEVEL 5
 #include "esp_log.h"
 #include <Arduino.h>
-
 #include "driver/timer.h"
+#include <initializer_list>
 
 #define CPUS_COUNT 2
+
+#define ONEWIRE_MAX_ROMS 8
 
 #define INTR_ATTR IRAM_ATTR
 
@@ -182,12 +184,14 @@ private:
     };
     
 public:   
-    Pin(pin_num_t pin, pin_mode_t mode = KEEP_CURRENT, bool inverted = false)
+    Pin(pin_num_t pin, pin_mode_t mode = KEEP_CURRENT, pin_mode_t value = KEEP_CURRENT, bool inverted = false)
         : m_pin(pin),
           m_inverted(inverted),
           m_lock(portMUX_INITIALIZER_UNLOCKED),
           m_interruptRecord(0, NONE_INTERRUPT)
     {
+        if (value != KEEP_CURRENT)
+            setValue(value);
         if (mode != KEEP_CURRENT)
             pinMode(m_pin, mode);
     }
@@ -549,6 +553,8 @@ private:
 class OneWire {
     typedef fastestTimer Timer;
     enum class State: uint8_t { MASTER, CHECK_RESET, READ, WRITE, SCANNED, WAIT };
+    typedef uint8_t roms_count_t;
+    static constexpr roms_count_t MAX_ROMS = ONEWIRE_MAX_ROMS;
 public:
     struct Timing {
         typedef Timer::value_t time_t; // in CPU ticks -> 1 / 240 MHz
@@ -565,6 +571,86 @@ public:
         value_t value;
         void INTR_ATTR operator =(volatile event_t& e) volatile { type = e.type; value = e.value; }
     };
+    class Rom {
+        Rom(const Rom&) = delete;
+    public:
+        typedef union {
+            uint64_t value;
+            uint8_t byte[8];
+        } rom_t;
+        Rom(const uint8_t* addr) {
+            _init(addr);
+        }
+        Rom(uint8_t familyCode, const uint8_t* addr) {
+            _init(familyCode, addr);
+        }
+        Rom(std::initializer_list<uint8_t> addr) {
+            _init(addr.begin());
+            if (addr.size() != 7) {
+                ESP_LOGW("OneWire:Rom:init", "Invalid ROM address length %d. Will be filled in by zeros.", addr.size());
+                for(auto i = addr.size(); i < 7; ++i)
+                    m_value.byte[i] = 0;
+                m_value.byte[7] = crc(m_value.byte, 7);
+            }
+        }
+        Rom(uint8_t familyCode, std::initializer_list<uint8_t> addr) {
+            _init(familyCode, addr.begin());
+            if (addr.size() != 6) {
+                ESP_LOGW("OneWire:Rom:init", "Invalid ROM address length %d. Will be filled in by zeros.", addr.size());
+                for(auto i = addr.size()+1; i < 7; ++i)
+                    m_value.byte[i] = 0;
+                m_value.byte[7] = crc(m_value.byte, 7);
+            }
+        }
+        const uint8_t* begin() const { return m_value.byte; }
+        const uint8_t* end() const { return m_value.byte+8; }
+        bool getBit(uint8_t bit) const { return m_value.byte[bit>>3] & (1<<(bit&7)); }
+
+        void enable(bool en = true) { m_enabled = en; }
+        void disable() { m_enabled = false; }
+        bool isEnabled() const { return m_enabled; }
+
+    private:
+        void _init(const uint8_t* addr) {
+            m_enabled = false;
+            for (uint8_t i = 0; i !=7; ++i)
+                m_value.byte[i] = addr[i];
+            m_value.byte[7] = crc(m_value.byte, 7);
+        }
+        void _init(uint8_t familyCode, const uint8_t* addr) {
+            m_enabled = false;
+            m_value.byte[0] = familyCode;
+            for (uint8_t i = 0; i !=6; ++i)
+                m_value.byte[i+1] = addr[i];
+            m_value.byte[7] = crc(m_value.byte, 7);
+        }
+
+        volatile bool m_enabled;
+        rom_t m_value;
+
+    public:
+        static uint8_t INTR_ATTR crc(uint8_t& _crc, bool bit) {
+            const bool doXor = (_crc ^ bit) & 1;
+            _crc >>= 1;
+            if (doXor)
+                _crc ^= 0x8C;
+            return _crc;
+        }
+        static uint8_t crc(uint8_t& _crc, uint8_t byte) {
+            for(uint8_t bit = 0; bit != 8; ++bit) {
+                crc(_crc, bool(byte & 1));
+                byte >>= 1;
+            }
+            return _crc;
+        }
+        static uint8_t crc(const uint8_t* data, size_t length) {
+            uint8_t _crc = 0;
+            for (const uint8_t* const stop = data + length; data != stop; ++data)
+                crc(_crc, *data);
+            return _crc;
+        }
+    };
+
     OneWire(Pin input,
             Pin output,
             Pin boost = Pin(DUMMY_PIN),
@@ -578,12 +664,16 @@ public:
           m_state(State::MASTER),
           m_bitIndex(0),
           m_receivingByte(0),
+          m_edgeTime(0),
+          m_selfAdvertising(false),
           m_buffer(),
           m_onEvent(onEvent)
     {
         m_input.setHigh();
         m_output.setHigh();
         m_boost.setLow();
+        for (roms_count_t i = 0; i != MAX_ROMS; ++i)
+            m_rom[i] = nullptr;
         becomeSlave();
     }
 
@@ -615,6 +705,9 @@ public:
         portEXIT_CRITICAL(&m_lock);
         return !v;
     }
+    bool scan(Rom::rom_t& rom) {
+        return false;
+    }
     void write(uint8_t v) {
         for (uint8_t i = 1; i != 0; i<<=1)
             _writeBit(v & i);
@@ -632,6 +725,17 @@ public:
     event_t::type_t getLastEventType() const { return m_buffer.top_ref().type; }
     event_t::value_t getLastEventValue() const { return m_buffer.top_ref().value; }
     void popEvent() { m_buffer.pop(); }
+    void selfAdvertising(bool enable) { m_selfAdvertising = enable; }
+    bool selfAdvertising() const { return m_selfAdvertising; }
+    bool addRom(Rom* rom) {
+        for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+            if (m_rom[i] == nullptr) {
+                m_rom[i] = rom;
+                return true;
+            }
+        }
+        return false;
+    }
 
 private:
     void _writeBit(const bool v) {
@@ -656,6 +760,16 @@ private:
         return v;
     }
 
+    bool INTR_ATTR _isAnyRomEnabled() const {
+        for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+            if (m_rom[i] == nullptr)
+                return false;
+            if (m_rom[i]->isEnabled())
+                return true;
+        }
+        return false;
+    }
+
     void INTR_ATTR _pinISR() {
         m_boost.setHigh();
         switch (m_state) {
@@ -663,17 +777,21 @@ private:
             break;
         case State::CHECK_RESET:
             if ((Timer::value() - m_edgeTime) > m_timing->H) {
-                wait<Timer>(m_timing->L);
-                m_output.setLow();
-                wait<Timer>(m_timing->M);
-                m_output.setHigh();
+                if (m_selfAdvertising && _isAnyRomEnabled()) {
+                    wait<Timer>(m_timing->L);
+                    m_output.setLow();
+                    wait<Timer>(m_timing->M);
+                    m_output.setHigh();
+                } else {
+                    wait<Timer>(m_timing->I);
+                }
                 m_receivingByte = 0;
                 m_bitIndex = 0;
                 _createEvent(event_t::type_t::RESET, 0);
             }
             m_state = State::READ;
-            m_input.clearInterruptFlag();
             m_input.interruptTrigger(FALLING);
+            m_input.clearInterruptFlag();
             break;
         case State::READ:
             m_edgeTime = wait<Timer>(m_timing->K);
@@ -723,6 +841,8 @@ private:
     volatile uint8_t m_bitIndex;
     volatile uint8_t m_receivingByte;
     volatile Timer::value_t m_edgeTime;
+    volatile bool m_selfAdvertising;
+    Rom* m_rom[MAX_ROMS];
     Buffer<event_t, 64> m_buffer;
     Callback m_onEvent;
 
@@ -773,9 +893,23 @@ static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
         portYIELD_FROM_ISR();
 }
 
+OneWire* slaveOw = nullptr;
+OneWire::Rom* slaveRom0 = nullptr;
+OneWire::Rom* slaveRom1 = nullptr;
+
+#define onSlave(ptr, fcn, msg, msgArgs...) \
+    if (ptr) { \
+        print(msg, msgArgs); \
+        ptr->fcn; \
+    } else { \
+        print("No slave available.\n");\
+    }
+
 static void oneWireMaster(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_MASTER_PIN;
-    OneWire ow(Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP), Pin(onewirePin));
+    OneWire ow(
+        Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP, HIGH),
+        Pin(onewirePin) );
     ow.becomeMaster();
     uint8_t v = 0xAA;
     for(;0;) {
@@ -800,6 +934,18 @@ static void oneWireMaster(void* args = nullptr) {
             case 'R':
                 print("reset: {} device available\n", ow.reset() ? "any" : "no");
                 break;
+            case 'E':
+                onSlave(slaveOw, selfAdvertising(true), "Enable slave selfadvertising.\n", 0);
+                break;
+            case 'D':
+                onSlave(slaveOw, selfAdvertising(false), "Disable slave selfadvertising.\n", 0);
+                break;
+            case '0':
+                onSlave(slaveRom0, enable(!slaveRom0->isEnabled()), "{} slave ROM0 advertising.\n", !slaveRom0->isEnabled());
+                break;
+            case '1':
+                onSlave(slaveRom1, enable(!slaveRom1->isEnabled()), "{} slave ROM1 advertising.\n", !slaveRom1->isEnabled());
+                break;
             default:
                 print("write 0x{:02X}\n", c);
                 ow.write(c);
@@ -814,11 +960,24 @@ static void oneWireMaster(void* args = nullptr) {
 static void oneWireSlave(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_SLAVE_PIN;
     OneWire ow(
-        Pin(onewirePin,OUTPUT_OPEN_DRAIN | PULLUP),
+        Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP, HIGH),
         Pin(onewirePin),
         Pin(21, OUTPUT),
         &OneWire::StandardTiming,
         Callback(notifyTaskFromISR, xTaskGetCurrentTaskHandle()) );
+    OneWire::Rom rom0({ 0x10,0x50,0xA9,0x0A,0x02,0x08,0x00 });
+    OneWire::Rom rom1({ 0x10,0x50,0xA9,0x0A,0x02,0x08,0x01 });
+    // this is pretty nasty
+    slaveOw = &ow;
+    slaveRom0 = &rom0;
+    slaveRom1 = &rom1;
+    print("ROM0: {:02X}\n", fmt::join(rom0, " "));
+    print("ROM1: {:02X}\n", fmt::join(rom1, " "));
+    ow.addRom(&rom0);
+    ow.addRom(&rom1);
+    rom0.enable();
+    rom1.enable();
+    ow.selfAdvertising(true);
     for(;;) {
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
         OneWire::event_t::type_t eventType = ow.getLastEventType();
@@ -894,8 +1053,8 @@ void setup() {
 
     Pin::initInterrupts();
 
-    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 2*1024, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 2*1024, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 4*1024, nullptr, 4, nullptr, 0);
+    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 4*1024, nullptr, 4, nullptr, 1);
     delay(500);
 }
 
