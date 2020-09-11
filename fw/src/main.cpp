@@ -39,6 +39,7 @@ static void oneWireMaster(void* args = nullptr) {
         Pin(onewirePin),
         Pin(OW_MASTER_TEST_PIN, OUTPUT) );
     ow.becomeMaster();
+    size_t foundDevices = 0;
     for(;;) {
         if (Serial.available()) {
             char c = Serial.read();
@@ -52,10 +53,11 @@ static void oneWireMaster(void* args = nullptr) {
             case 'S':
                 print("Searching bus:\n");
                 ow.resetSearch();
+                foundDevices = 0;
                 while(ow.search()) {
-                    print("  Found 0x{:016X}\n", ow.LastFoundRom().value);
+                    print("  Found {}. device at 0x{:016X}\n", ++foundDevices, ow.LastFoundRom().value);
                 }
-                print("Search complete.\n");
+                print("Search complete, {} device{} found.\n", foundDevices, foundDevices == 1 ? "" : "s");
                 break;
             case 'E':
                 onSlave(slaveOw, selfAdvertising(true), "Enable slave selfadvertising.\n", 0);
