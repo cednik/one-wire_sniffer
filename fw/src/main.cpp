@@ -67,7 +67,7 @@ static void oneWireMaster(void* args = nullptr) {
                 break;
             case '0' ... '2':
                 c -= '0';
-                onSlave(slaveRom[uint8_t(c)], enable(!slaveRom[uint8_t(c)]->isEnabled()), "{} slave ROM{} advertising.\n", !slaveRom[uint8_t(c)]->isEnabled(), uint8_t(c));
+                onSlave(slaveRom[uint8_t(c)], enable(!slaveRom[uint8_t(c)]->isEnabled()), "slave ROM{} advertising {}.\n", uint8_t(c), !slaveRom[uint8_t(c)]->isEnabled() ? "enabled" : "disabled");
                 break;
             default:
                 print("write 0x{:02X}\n", c);

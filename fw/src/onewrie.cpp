@@ -482,7 +482,8 @@ void OneWire::_pinISR() {
                 if (m_rom[i] == nullptr)
                     break;
                 m_rom[i]->setActiveState();
-                m_rom[i]->event(e);
+                if (m_rom[i]->isActive())
+                    m_rom[i]->event(e);
             }
             _event(e);
             m_state = State::READ;
@@ -512,7 +513,8 @@ void OneWire::_pinISR() {
             for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
                 if (m_rom[i] == nullptr)
                     break;
-                m_rom[i]->event(e);
+                if (m_rom[i]->isActive())
+                    m_rom[i]->event(e);
             }
             _event(e);
             m_receivingByte = 0;
