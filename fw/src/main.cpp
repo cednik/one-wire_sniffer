@@ -15,6 +15,10 @@
 #define ONEWIRE_MASTER_PIN 22
 #define ONEWIRE_SLAVE_PIN  23
 
+#define OW_SLAVE_TEST_PIN   21
+#define OW_MASTER_TEST_PIN  18
+#define ISR_TEST_PIN        19
+
 #include <format.h>
 
 template <typename S, typename... Args>
@@ -355,7 +359,7 @@ portMUX_TYPE Pin::s_lock = portMUX_INITIALIZER_UNLOCKED;
 Pin::InterruptHandler Pin::s_interruptHandler[CPUS_COUNT][Pin::ISR_SLOTS] = { 0 };
 intr_handle_t Pin::s_interruptHandle[CPUS_COUNT] = { nullptr };
 
-Pin isrOut(19, OUTPUT);
+Pin isrOut(ISR_TEST_PIN, OUTPUT);
 
 void INTR_ATTR Pin::ISR(void* args) {
         isrOut.setHigh();
@@ -368,7 +372,7 @@ void INTR_ATTR Pin::ISR(void* args) {
         for (uint8_t i = 0; i != ISR_SLOTS; ++i) {
             if ((status & s_interruptHandler[cpu][i].pinMask) != 0) {
                 s_interruptHandler[cpu][i].callback();
-                //break;
+                break;
             }
         }
         isrOut.setLow();
@@ -552,32 +556,59 @@ private:
 
 class OneWire {
     typedef fastestTimer Timer;
-    enum class State: uint8_t { MASTER, CHECK_RESET, READ, WRITE, SCANNED, WAIT };
+    enum class State: uint8_t { MASTER, CHECK_RESET, READ, WRITE, SEARCH };
+    enum class SlaveSearchState: uint8_t { IDLE, READY, SEND_BIT, SEND_COMPLEMENT, READ_BIT };
     typedef uint8_t roms_count_t;
     static constexpr roms_count_t MAX_ROMS = ONEWIRE_MAX_ROMS;
+
+    void INTR_ATTR _pinISR();
+
 public:
     struct Timing {
         typedef Timer::value_t time_t; // in CPU ticks -> 1 / 240 MHz
         // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
         //     plus slave timing - see StandardTiming definition below
-        time_t A,B,C,D,E,F,G,H,I,J,K,L,M;
+        time_t A,B,C,D,E,F,G,H,I,J,K,L,M,N;
     };
     static const DRAM_ATTR Timing StandardTiming;
     static const DRAM_ATTR Timing OverdriveTiming;
     struct event_t {
-        enum class type_t: uint8_t { RECEIVED, RESET };
+        enum class type_t: uint8_t {
+            RECEIVED,
+            RESET,
+            SEARCH_START,
+            SEARCH_SEND_BIT,
+            SEARCH_SEND_COMPLEMENT,
+            SEARCH_READ_BIT,
+            SEARCH_COMPLETE,
+            ACTIVATE_ROM,
+            DEACTIVATE_ROM
+        };
         typedef uint8_t value_t;
+        typedef Timer::value_t time_t;
+        time_t time;
         type_t type;
         value_t value;
-        void INTR_ATTR operator =(volatile event_t& e) volatile { type = e.type; value = e.value; }
+        void INTR_ATTR operator =(volatile event_t& e) volatile {
+            time = e.time;
+            type = e.type;
+            value = e.value;
+        }
     };
     class Rom {
+        friend void INTR_ATTR OneWire::_pinISR();
         Rom(const Rom&) = delete;
     public:
-        typedef union {
+        union rom_t {
             uint64_t value;
             uint8_t byte[8];
-        } rom_t;
+            struct {
+                uint8_t family;
+                uint8_t addr[6];
+                uint8_t crc;
+            };
+            bool operator == (const rom_t& other) { return value == other.value; }
+        };
         Rom(const uint8_t* addr) {
             _init(addr);
         }
@@ -590,18 +621,20 @@ public:
                 ESP_LOGW("OneWire:Rom:init", "Invalid ROM address length %d. Will be filled in by zeros.", addr.size());
                 for(auto i = addr.size(); i < 7; ++i)
                     m_value.byte[i] = 0;
-                m_value.byte[7] = crc(m_value.byte, 7);
+                m_value.crc = crc(m_value.byte, 7);
             }
         }
         Rom(uint8_t familyCode, std::initializer_list<uint8_t> addr) {
             _init(familyCode, addr.begin());
             if (addr.size() != 6) {
                 ESP_LOGW("OneWire:Rom:init", "Invalid ROM address length %d. Will be filled in by zeros.", addr.size());
-                for(auto i = addr.size()+1; i < 7; ++i)
-                    m_value.byte[i] = 0;
-                m_value.byte[7] = crc(m_value.byte, 7);
+                for(auto i = addr.size(); i < 7; ++i)
+                    m_value.addr[i] = 0;
+                m_value.crc = crc(m_value.byte, 7);
             }
         }
+        
+        const rom_t& value() const { return m_value; }
         const uint8_t* begin() const { return m_value.byte; }
         const uint8_t* end() const { return m_value.byte+8; }
         bool getBit(uint8_t bit) const { return m_value.byte[bit>>3] & (1<<(bit&7)); }
@@ -610,23 +643,63 @@ public:
         void disable() { m_enabled = false; }
         bool isEnabled() const { return m_enabled; }
 
+        void setAlarm(bool v = true) { m_alarm = v; }
+        void clearAlarm() { m_alarm = false; }
+        bool alarm() const { return m_alarm; }
+
+        bool isActive() const { return m_enabled && m_active; }
+
+        void registerCallback(Callback callback) { m_onEvent = callback; }
+        const event_t& getLastEvent() const { return const_cast<const event_t&>(m_buffer.top_ref()); }
+        void popEvent() { m_buffer.pop(); }
+        size_t available() const { return m_buffer.size(); }
+
     private:
         void _init(const uint8_t* addr) {
             m_enabled = false;
+            m_active = true;
+            m_alarm = false;
             for (uint8_t i = 0; i !=7; ++i)
                 m_value.byte[i] = addr[i];
-            m_value.byte[7] = crc(m_value.byte, 7);
+            m_value.crc = crc(m_value.byte, 7);
         }
         void _init(uint8_t familyCode, const uint8_t* addr) {
             m_enabled = false;
-            m_value.byte[0] = familyCode;
+            m_active = true;
+            m_alarm = false;
+            m_value.family = familyCode;
             for (uint8_t i = 0; i !=6; ++i)
-                m_value.byte[i+1] = addr[i];
-            m_value.byte[7] = crc(m_value.byte, 7);
+                m_value.addr[i] = addr[i];
+            m_value.crc = crc(m_value.byte, 7);
+        }
+
+        void INTR_ATTR event(const event_t& e) {
+            m_buffer.push(e);
+            m_onEvent();
+        }
+        void INTR_ATTR event(event_t::type_t type, event_t::value_t value) {
+            event_t e;
+            e.time = Timer::value();
+            e.type = type;
+            e.value = value;
+            event(e);
+        }
+
+        void setActiveState() {
+            m_active = true;
+            //event(event_t::type_t::ACTIVATE_ROM, 0);
+        }
+        void setWaitState(uint8_t bit) {
+            m_active = false;
+            event(event_t::type_t::DEACTIVATE_ROM, bit);
         }
 
         volatile bool m_enabled;
+        volatile bool m_active;
+        volatile bool m_alarm;
         rom_t m_value;
+        Buffer<event_t, 256> m_buffer;
+        Callback m_onEvent;
 
     public:
         static uint8_t INTR_ATTR crc(uint8_t& _crc, bool bit) {
@@ -650,6 +723,18 @@ public:
             return _crc;
         }
     };
+    enum class CMD: uint8_t {
+            SEARCH              = 0xF0,
+            SEARCH_ALARM        = 0xEC
+        };
+private:
+    struct search_state_t {
+        Rom::rom_t rom;
+        uint8_t LastDiscrepancy;
+        uint8_t LastFamilyDiscrepancy;
+        bool LastDeviceFlag;
+    };
+public:
 
     OneWire(Pin input,
             Pin output,
@@ -666,6 +751,8 @@ public:
           m_receivingByte(0),
           m_edgeTime(0),
           m_selfAdvertising(false),
+          m_slaveSearchState(SlaveSearchState::IDLE),
+          m_searchState(),
           m_buffer(),
           m_onEvent(onEvent)
     {
@@ -684,13 +771,155 @@ public:
         m_buffer.clear();
         m_state = State::MASTER;
     }
-
     void becomeSlave() {
         if (m_state != State::MASTER)
             return;
+        m_receivingByte = 0;
+        m_bitIndex = 0;
         m_state = State::READ;
+        m_slaveSearchState = SlaveSearchState::IDLE;
         m_input.attachInterrupt(pinISR, this, FALLING);
     }
+
+    void resetSearch() {
+        m_searchState.rom.value = 0;
+        m_searchState.LastDiscrepancy = 0;
+        m_searchState.LastFamilyDiscrepancy = 0;
+        m_searchState.LastDeviceFlag = false;
+    }
+    bool verify(const Rom::rom_t& rom) {
+        search_state_t stateBackup = m_searchState;
+        bool res = false;
+        m_searchState.rom = rom;
+        m_searchState.LastDiscrepancy = 64;
+        m_searchState.LastDeviceFlag = false;
+        if (search())
+            res = (m_searchState.rom == rom);
+        m_searchState = stateBackup;
+        return res;
+    }
+    void searchForFamily(uint8_t family) {
+        m_searchState.rom.value = family;
+        m_searchState.LastDiscrepancy = 64;
+        m_searchState.LastFamilyDiscrepancy = 0;
+        m_searchState.LastDeviceFlag = false;
+    }
+    void skipThisFamily() {
+        m_searchState.LastDiscrepancy = m_searchState.LastFamilyDiscrepancy;
+        m_searchState.LastFamilyDiscrepancy = 0;
+
+        // check for end of list
+        if (m_searchState.LastDiscrepancy == 0)
+            m_searchState.LastDeviceFlag = true;
+    }
+    bool search(bool alarmOnly = false) {
+        uint8_t id_bit_number = 1;
+        uint8_t last_zero = 0;
+        uint8_t rom_byte_number = 0;
+        uint8_t rom_byte_mask = 1;
+        uint8_t crc = 0;
+        bool search_result = false;
+        bool search_direction = false;
+        bool id_bit = false;
+        bool cmp_id_bit = false;
+
+        // if the last call was not the last one
+        if (!m_searchState.LastDeviceFlag) {
+            // 1-Wire reset
+            print("    Search: start\n");
+            if (!reset()) {
+                // reset the search
+                resetSearch();
+                print("    Search: no device available\n");
+                return false;
+            }
+
+            // issue the search command 
+            write(alarmOnly ? CMD::SEARCH_ALARM : CMD::SEARCH);
+            wait<Timer>(240*250);
+
+            // loop to do the search
+            do {
+                // read a bit and its complement
+                id_bit = _readBit();
+                cmp_id_bit = _readBit();
+                //print("    Search: bit {:2} = {} | {}\n", id_bit_number, id_bit, cmp_id_bit);
+
+                // check for no devices on 1-wire
+                if ((id_bit == 1) && (cmp_id_bit == 1)) {
+                    print("    Search: both read bits {} are true - no devices\n", id_bit_number);
+                    break;
+                } else {
+                    // all devices coupled have 0 or 1
+                    if (id_bit != cmp_id_bit) {
+                        search_direction = id_bit;  // bit write value for search
+                    } else {
+                        // if this discrepancy if before the Last Discrepancy
+                        // on a previous next then pick the same as last time
+                        if (id_bit_number < m_searchState.LastDiscrepancy)
+                            search_direction = ((m_searchState.rom.byte[rom_byte_number] & rom_byte_mask) > 0);
+                        else
+                            // if equal to last pick 1, if not then pick 0
+                            search_direction = (id_bit_number == m_searchState.LastDiscrepancy);
+
+                        // if 0 was picked then record its position in LastZero
+                        if (search_direction == 0) {
+                            last_zero = id_bit_number;
+
+                            // check for Last discrepancy in family
+                            if (last_zero < 9)
+                                m_searchState.LastFamilyDiscrepancy = last_zero;
+                        }
+                    }
+
+                    // set or clear the bit in the ROM byte rom_byte_number
+                    // with mask rom_byte_mask
+                    if (search_direction == 1)
+                        m_searchState.rom.byte[rom_byte_number] |= rom_byte_mask;
+                    else
+                        m_searchState.rom.byte[rom_byte_number] &= ~rom_byte_mask;
+
+                    // serial number search direction write bit
+                    _writeBit(search_direction);
+
+                    // increment the byte counter id_bit_number
+                    // and shift the mask rom_byte_mask
+                    id_bit_number++;
+                    rom_byte_mask <<= 1;
+        
+                    // if the mask is 0 then go to new SerialNum byte rom_byte_number and reset mask
+                    if (rom_byte_mask == 0) {
+                        Rom::crc(crc, m_searchState.rom.byte[rom_byte_number]);  // accumulate the CRC
+                        rom_byte_number++;
+                        rom_byte_mask = 1;
+                    }
+                }
+            } while(rom_byte_number < 8);  // loop until through all ROM bytes 0-7
+      
+            // if the search was successful then
+            if (!((id_bit_number < 65) || (crc != 0))) {
+                // search successful so set m_searchState.LastDiscrepancy,m_searchState.LastDeviceFlag,search_result
+                m_searchState.LastDiscrepancy = last_zero;
+ 
+                // check for last device
+                if (m_searchState.LastDiscrepancy == 0) {
+                    m_searchState.LastDeviceFlag = true;
+                    print("    Search: found last device\n");
+                }
+                
+                search_result = true;
+            }
+        }
+     
+        // if no device found then reset counters so next 'search' will be like a first
+        if (!search_result || m_searchState.rom.family == 0) {
+            resetSearch();
+            search_result = false;
+        }
+     
+        return search_result;
+    }
+    const Rom::rom_t& LastFoundRom() const { return m_searchState.rom; }
 
     bool reset() {
         portENTER_CRITICAL(&m_lock);
@@ -705,13 +934,6 @@ public:
         portEXIT_CRITICAL(&m_lock);
         return !v;
     }
-    bool scan(Rom::rom_t& rom) {
-        return false;
-    }
-    void write(uint8_t v) {
-        for (uint8_t i = 1; i != 0; i<<=1)
-            _writeBit(v & i);
-    }
     uint8_t read() {
         uint8_t v = 0;
         if (m_state == State::MASTER) {
@@ -722,11 +944,19 @@ public:
         }
         return v;
     }
-    event_t::type_t getLastEventType() const { return m_buffer.top_ref().type; }
-    event_t::value_t getLastEventValue() const { return m_buffer.top_ref().value; }
+    void write(CMD cmd) { write(uint8_t(cmd)); }
+    void write(uint8_t v) {
+        for (uint8_t i = 1; i != 0; i<<=1)
+            _writeBit(v & i);
+    }
+    
+    const event_t& getLastEvent() const { return const_cast<const event_t&>(m_buffer.top_ref()); }
     void popEvent() { m_buffer.pop(); }
+    size_t available() const { return m_buffer.size(); }
+
     void selfAdvertising(bool enable) { m_selfAdvertising = enable; }
     bool selfAdvertising() const { return m_selfAdvertising; }
+
     bool addRom(Rom* rom) {
         for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
             if (m_rom[i] == nullptr) {
@@ -750,84 +980,58 @@ private:
     }
     bool _readBit() {
         portENTER_CRITICAL(&m_lock);
+        m_boost.setHigh();
         m_output.setLow();
         wait<Timer>(m_timing->A);
         m_output.setHigh();
         wait<Timer>(m_timing->E);
         const bool v = m_input.read();
+        m_boost.setLow();
         wait<Timer>(m_timing->F);
         portEXIT_CRITICAL(&m_lock);
         return v;
     }
 
-    bool INTR_ATTR _isAnyRomEnabled() const {
+    void INTR_ATTR _slaveWriteBit(const bool v) {
+        if (!v) {
+            m_output.setLow();
+            wait<Timer>(m_timing->N);
+            m_output.setHigh();
+            m_input.clearInterruptFlag();
+        }
+    }
+    void INTR_ATTR _slaveReadBit() { // reads to m_receivingByte
+        m_edgeTime = wait<Timer>(m_timing->K);
+        m_receivingByte >>= 1;
+        if (m_input.read()) {
+            m_receivingByte |= 0x80;
+        } else {
+            m_state = State::CHECK_RESET;
+            m_input.interruptTrigger(RISING);
+        }
+    }
+    void INTR_ATTR _slaveSearchSendBit(bool complement) {
+        m_receivingByte = 1;
         for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
             if (m_rom[i] == nullptr)
-                return false;
-            if (m_rom[i]->isEnabled())
-                return true;
+                break;
+            if (m_rom[i]->isActive() && (m_rom[i]->getBit(m_bitIndex) ^ !complement)) {
+                m_receivingByte =  0;
+                break;
+            }
         }
-        return false;
+        _slaveWriteBit(m_receivingByte);
+        _event(complement ? event_t::type_t::SEARCH_SEND_COMPLEMENT : event_t::type_t::SEARCH_SEND_BIT, m_bitIndex | (m_receivingByte<<7));
     }
 
-    void INTR_ATTR _pinISR() {
-        m_boost.setHigh();
-        switch (m_state) {
-        case State::MASTER:
-            break;
-        case State::CHECK_RESET:
-            if ((Timer::value() - m_edgeTime) > m_timing->H) {
-                if (m_selfAdvertising && _isAnyRomEnabled()) {
-                    wait<Timer>(m_timing->L);
-                    m_output.setLow();
-                    wait<Timer>(m_timing->M);
-                    m_output.setHigh();
-                } else {
-                    wait<Timer>(m_timing->I);
-                }
-                m_receivingByte = 0;
-                m_bitIndex = 0;
-                _createEvent(event_t::type_t::RESET, 0);
-            }
-            m_state = State::READ;
-            m_input.interruptTrigger(FALLING);
-            m_input.clearInterruptFlag();
-            break;
-        case State::READ:
-            m_edgeTime = wait<Timer>(m_timing->K);
-            m_receivingByte >>= 1;
-            if (m_input.read()) {
-                m_receivingByte |= 0x80;
-            } else {
-                m_state = State::CHECK_RESET;
-                m_input.interruptTrigger(RISING);
-            }
-            if (++m_bitIndex == 8) {
-                _createEvent(event_t::type_t::RECEIVED, m_receivingByte);
-                m_receivingByte = 0;
-                m_bitIndex = 0;
-            }
-            break;
-        case State::WRITE:
-            m_output.setValue(m_buffer.top_ref().value & (1<<m_bitIndex));
-            if (++m_bitIndex == 8) {
-                if (!m_buffer.empty())
-                    m_buffer.pop();
-                m_bitIndex = 0;
-            }
-            break;
-        case State::SCANNED:
-            break;
-        case State::WAIT:
-            break;
-        }
-        m_boost.setLow();
-    }
-
-    void INTR_ATTR _createEvent(event_t::type_t type, event_t::value_t value) {
+    void INTR_ATTR _event(event_t::type_t type, event_t::value_t value) {
         event_t e;
+        e.time = Timer::value();
         e.type = type;
         e.value = value;
+        _event(e);
+    }
+    void INTR_ATTR _event(const event_t&e) {
         m_buffer.push(e);
         m_onEvent();
     }
@@ -842,15 +1046,140 @@ private:
     volatile uint8_t m_receivingByte;
     volatile Timer::value_t m_edgeTime;
     volatile bool m_selfAdvertising;
+    volatile SlaveSearchState m_slaveSearchState;
+    search_state_t m_searchState;
     Rom* m_rom[MAX_ROMS];
-    Buffer<event_t, 64> m_buffer;
+    Buffer<event_t, 256> m_buffer;
     Callback m_onEvent;
 
     static void INTR_ATTR pinISR(void* args) {
         reinterpret_cast<OneWire*>(args)->_pinISR();
     }
-        
 };
+
+void INTR_ATTR OneWire::_pinISR() {
+    m_boost.setHigh();
+    switch (m_state) {
+    case State::MASTER:
+        break;
+    case State::CHECK_RESET:
+        if ((Timer::value() - m_edgeTime) > m_timing->H) {
+            bool isAnyRomEnabled = false;
+            for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+                if (m_rom[i] == nullptr)
+                    break;
+                if (m_rom[i]->isEnabled()) {
+                    isAnyRomEnabled =  true;
+                    break;
+                }
+            }
+            if (m_selfAdvertising && isAnyRomEnabled) {
+                wait<Timer>(m_timing->L);
+                m_output.setLow();
+                wait<Timer>(m_timing->M);
+                m_output.setHigh();
+            } else {
+                wait<Timer>(m_timing->I);
+            }
+            m_receivingByte = 0;
+            m_bitIndex = 0;
+            m_slaveSearchState = SlaveSearchState::READY;
+            const event_t e = {
+                .time = Timer::value(),
+                .type = event_t::type_t::RESET,
+                .value = 0
+            };
+            for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+                if (m_rom[i] == nullptr)
+                    break;
+                m_rom[i]->setActiveState();
+                m_rom[i]->event(e);
+            }
+            _event(e);
+            m_state = State::READ;
+        } else {
+            m_state = ( m_slaveSearchState == SlaveSearchState::IDLE
+                        || m_slaveSearchState == SlaveSearchState::READY ) ? State::READ : State::SEARCH;
+        }
+        m_input.interruptTrigger(FALLING);
+        m_input.clearInterruptFlag();
+        break;
+    case State::READ:
+        _slaveReadBit();
+        if (++m_bitIndex == 8) {
+            if (m_slaveSearchState == SlaveSearchState::READY) {
+                if ((m_receivingByte == uint8_t(CMD::SEARCH) || m_receivingByte == uint8_t(CMD::SEARCH_ALARM))) {
+                    m_slaveSearchState = SlaveSearchState::SEND_BIT;
+                    m_state = State::SEARCH;
+                } else {
+                    m_slaveSearchState = SlaveSearchState::IDLE;
+                }
+            }
+            const event_t e = {
+                .time = Timer::value(),
+                .type = event_t::type_t::RECEIVED,
+                .value = m_receivingByte
+            };
+            for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+                if (m_rom[i] == nullptr)
+                    break;
+                m_rom[i]->event(e);
+            }
+            _event(e);
+            m_receivingByte = 0;
+            m_bitIndex = 0;
+        }
+        break;
+    case State::WRITE:
+        _slaveWriteBit(m_buffer.top_ref().value & (1<<m_bitIndex));
+        if (++m_bitIndex == 8) {
+            if (!m_buffer.empty())
+                m_buffer.pop();
+            m_bitIndex = 0;
+        }
+        break;
+    case State::SEARCH:
+        switch (m_slaveSearchState) {
+        case SlaveSearchState::IDLE:
+        case SlaveSearchState::READY:
+            break;
+        case SlaveSearchState::SEND_BIT:
+            _slaveSearchSendBit(false);
+            m_slaveSearchState = SlaveSearchState::SEND_COMPLEMENT;
+            break;
+        case SlaveSearchState::SEND_COMPLEMENT:
+            _slaveSearchSendBit(true);
+            m_slaveSearchState = SlaveSearchState::READ_BIT;
+            break;
+        case SlaveSearchState::READ_BIT:
+            m_receivingByte = 0;
+            _slaveReadBit(); // read value is in m_receivingByte
+            _event(event_t::type_t::SEARCH_READ_BIT, m_bitIndex | m_receivingByte);
+            for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+                if (m_rom[i] == nullptr)
+                    break;
+                if (m_rom[i]->isActive() && (bool(m_receivingByte) != m_rom[i]->getBit(m_bitIndex))) {
+                    m_rom[i]->setWaitState(m_bitIndex+1);
+                }
+            }
+            if (++m_bitIndex == 64) {
+                if (m_receivingByte != 0) {
+                    m_receivingByte = 0;
+                    m_state = State::READ;
+                }
+                m_bitIndex = 0;
+                m_slaveSearchState = SlaveSearchState::IDLE;
+                _event(event_t::type_t::SEARCH_COMPLETE, 0);
+            } else {
+                m_slaveSearchState = SlaveSearchState::SEND_BIT;
+            }
+            break;
+        }
+        break;
+    }
+    m_boost.setLow();
+}
+
 #define US2TICKS(us) OneWire::Timing::time_t((us) * 240)
 // based on https://www.maximintegrated.com/en/design/technical-documents/app-notes/1/126.html
 //     plus slave timing
@@ -859,7 +1188,7 @@ const DRAM_ATTR OneWire::Timing OneWire::StandardTiming = {
     .A = US2TICKS(  6 - 0.0), // master write zero first
     .B = US2TICKS( 64 - 0.0), // master write zero second
     .C = US2TICKS( 60 - 0.0), // master write one first
-    .D = US2TICKS( 10 - 0.0), // master write one first
+    .D = US2TICKS( 10 - 0.0), // master write one second
     .E = US2TICKS(  9 - 0.0), // master read sample
     .F = US2TICKS( 55 - 0.0), // master read pause
     .G = US2TICKS(  0 - 0.0), // master reset before
@@ -868,7 +1197,8 @@ const DRAM_ATTR OneWire::Timing OneWire::StandardTiming = {
     .J = US2TICKS(410 - 0.0), // master reset pause
     .K = US2TICKS( 35 - 2.5), // slave read sample
     .L = US2TICKS( 35 - 0.0), // slave presence responce
-    .M = US2TICKS( 70 - 0.0)  // slave presence release
+    .M = US2TICKS( 70 - 0.0), // slave presence release
+    .N = US2TICKS( 30 - 0.0)  // slave write zero
 };
 const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = { // Too fast for ESP32
     .A = US2TICKS(  1.0),
@@ -883,7 +1213,8 @@ const DRAM_ATTR OneWire::Timing OneWire::OverdriveTiming = { // Too fast for ESP
     .J = US2TICKS( 40.0),
     .K = US2TICKS(  4.5),
     .L = US2TICKS(  4.5),
-    .M = US2TICKS(  8.5)
+    .M = US2TICKS(  8.5),
+    .N = US2TICKS(  3.0)
 };
 
 static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
@@ -893,9 +1224,15 @@ static void INTR_ATTR notifyTaskFromISR(Callback::callback_arg_t args) {
         portYIELD_FROM_ISR();
 }
 
-OneWire* slaveOw = nullptr;
-OneWire::Rom* slaveRom0 = nullptr;
-OneWire::Rom* slaveRom1 = nullptr;
+static constexpr uint8_t ROMS_COUNT = 3;
+static constexpr uint8_t ROM_ADDRESS[ROMS_COUNT][7] = {
+    { 0x10,0x50,0xA9,0x0A,0x02,0x08,0x00 },
+    { 0x10,0x51,0xA9,0x0A,0x02,0x08,0x00 },
+    { 0x10,0x52,0xA9,0x0A,0x02,0x08,0x00 }
+};
+
+static OneWire* slaveOw = nullptr;
+static OneWire::Rom* slaveRom[ROMS_COUNT] = { nullptr };
 
 #define onSlave(ptr, fcn, msg, msgArgs...) \
     if (ptr) { \
@@ -909,7 +1246,8 @@ static void oneWireMaster(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_MASTER_PIN;
     OneWire ow(
         Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP, HIGH),
-        Pin(onewirePin) );
+        Pin(onewirePin),
+        Pin(OW_MASTER_TEST_PIN, OUTPUT) );
     ow.becomeMaster();
     uint8_t v = 0xAA;
     for(;0;) {
@@ -932,7 +1270,15 @@ static void oneWireMaster(void* args = nullptr) {
                 print("\n");
                 break;
             case 'R':
-                print("reset: {} device available\n", ow.reset() ? "any" : "no");
+                print("reset: {} device available.\n", ow.reset() ? "any" : "no");
+                break;
+            case 'S':
+                print("Searching bus:\n");
+                ow.resetSearch();
+                while(ow.search()) {
+                    print("  Found 0x{:016X}\n", ow.LastFoundRom().value);
+                }
+                print("Search complete.\n");
                 break;
             case 'E':
                 onSlave(slaveOw, selfAdvertising(true), "Enable slave selfadvertising.\n", 0);
@@ -940,11 +1286,9 @@ static void oneWireMaster(void* args = nullptr) {
             case 'D':
                 onSlave(slaveOw, selfAdvertising(false), "Disable slave selfadvertising.\n", 0);
                 break;
-            case '0':
-                onSlave(slaveRom0, enable(!slaveRom0->isEnabled()), "{} slave ROM0 advertising.\n", !slaveRom0->isEnabled());
-                break;
-            case '1':
-                onSlave(slaveRom1, enable(!slaveRom1->isEnabled()), "{} slave ROM1 advertising.\n", !slaveRom1->isEnabled());
+            case '0' ... '2':
+                c -= '0';
+                onSlave(slaveRom[uint8_t(c)], enable(!slaveRom[uint8_t(c)]->isEnabled()), "{} slave ROM{} advertising.\n", !slaveRom[uint8_t(c)]->isEnabled(), uint8_t(c));
                 break;
             default:
                 print("write 0x{:02X}\n", c);
@@ -962,41 +1306,88 @@ static void oneWireSlave(void* args = nullptr) {
     OneWire ow(
         Pin(onewirePin, OUTPUT_OPEN_DRAIN | PULLUP, HIGH),
         Pin(onewirePin),
-        Pin(21, OUTPUT),
+        Pin(OW_SLAVE_TEST_PIN, OUTPUT),
         &OneWire::StandardTiming,
         Callback(notifyTaskFromISR, xTaskGetCurrentTaskHandle()) );
-    OneWire::Rom rom0({ 0x10,0x50,0xA9,0x0A,0x02,0x08,0x00 });
-    OneWire::Rom rom1({ 0x10,0x50,0xA9,0x0A,0x02,0x08,0x01 });
     // this is pretty nasty
     slaveOw = &ow;
-    slaveRom0 = &rom0;
-    slaveRom1 = &rom1;
-    print("ROM0: {:02X}\n", fmt::join(rom0, " "));
-    print("ROM1: {:02X}\n", fmt::join(rom1, " "));
-    ow.addRom(&rom0);
-    ow.addRom(&rom1);
-    rom0.enable();
-    rom1.enable();
+    for (uint8_t i = 0; i != ROMS_COUNT; ++i) {
+        slaveRom[i] = new OneWire::Rom(&ROM_ADDRESS[i][0]);
+        slaveRom[i]->registerCallback(Callback(notifyTaskFromISR, xTaskGetCurrentTaskHandle()));
+        ow.addRom(slaveRom[i]);
+        slaveRom[i]->enable();
+        print("ROM{}: {:02X}\n", i, fmt::join(*slaveRom[i], " "));
+    }
     ow.selfAdvertising(true);
     for(;;) {
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        OneWire::event_t::type_t eventType = ow.getLastEventType();
-        OneWire::event_t::value_t eventValue = ow.getLastEventValue();
-        ow.popEvent();
-        Printer::acquire();
-        print("OneWireSlave:");
-        switch(eventType) {
-        case OneWire::event_t::type_t::RECEIVED:
-            print("receive 0x{:02X}\n", eventValue);
-            break;
-        case OneWire::event_t::type_t::RESET:
-            print("reset\n");
-            break;
-        default:
-            print("unknown 0x{:02X}\n", uint8_t(eventType));
-            break;
+        while (ow.available()) {
+            OneWire::event_t e = ow.getLastEvent();
+            OneWire::event_t::time_t eventTime   = e.time;
+            OneWire::event_t::type_t eventType   = e.type;
+            OneWire::event_t::value_t eventValue = e.value;
+            ow.popEvent();
+            Printer::acquire();
+            print("{:10}\tOneWireSlave: ", eventTime);
+            switch(eventType) {
+            case OneWire::event_t::type_t::RECEIVED:
+                print("receive 0x{:02X}\n", eventValue);
+                break;
+            case OneWire::event_t::type_t::RESET:
+                print("reset\n");
+                break;
+            case OneWire::event_t::type_t::SEARCH_START:
+                print("search start\n");
+                break;
+            case OneWire::event_t::type_t::SEARCH_SEND_BIT:
+                print("search send  bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                break;
+            case OneWire::event_t::type_t::SEARCH_SEND_COMPLEMENT:
+                print("search send ~bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                break;
+            case OneWire::event_t::type_t::SEARCH_READ_BIT:
+                print("search READ  bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                break;
+            case OneWire::event_t::type_t::SEARCH_COMPLETE:
+                print("search complete\n");
+                break;
+            default:
+                print("unknown 0x{:02X} = 0x{:02X}\n", uint8_t(eventType), eventValue);
+                break;
+            }
+            Printer::release();
         }
-        Printer::release();
+        for (auto rom: slaveRom) {
+            if (rom == nullptr)
+                continue;
+            while (rom->available()) {
+                OneWire::event_t e = rom->getLastEvent();
+                OneWire::event_t::time_t eventTime   = e.time;
+                OneWire::event_t::type_t eventType   = e.type;
+                OneWire::event_t::value_t eventValue = e.value;
+                rom->popEvent();
+                Printer::acquire();
+                print("{:10}\tOneWireSlave::Rom 0x{:016X}: ", eventTime, rom->value().value);
+                switch(eventType) {
+                case OneWire::event_t::type_t::RECEIVED:
+                    print("receive 0x{:02X}\n", eventValue);
+                    break;
+                case OneWire::event_t::type_t::RESET:
+                    print("reset\n");
+                    break;
+                case OneWire::event_t::type_t::ACTIVATE_ROM:
+                    print("activated\n");
+                    break;
+                case OneWire::event_t::type_t::DEACTIVATE_ROM:
+                    print("deactivated on bit {}\n", eventValue);
+                    break;
+                default:
+                    print("unknown 0x{:02X} = 0x{:02X}\n", uint8_t(eventType), eventValue);
+                    break;
+                }
+                Printer::release();
+            }
+        }
     }
 }
 
@@ -1054,7 +1445,7 @@ void setup() {
     Pin::initInterrupts();
 
     xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 4*1024, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 4*1024, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 8*1024, nullptr, 4, nullptr, 1);
     delay(500);
 }
 
