@@ -14,6 +14,7 @@ class OneWire {
     static constexpr roms_count_t MAX_ROMS = 8;
 
     void INTR_ATTR _pinISR();
+    void INTR_ATTR _slaveProcessReceivedByte();
 
 public:
     struct Timing {
@@ -26,8 +27,9 @@ public:
     static const DRAM_ATTR Timing OverdriveTiming;
     struct event_t {
         enum class type_t: uint8_t {
-            RECEIVED,
             RESET,
+            RECEIVED_BIT,
+            RECEIVED,
             SEARCH_START,
             SEARCH_SEND_BIT,
             SEARCH_SEND_COMPLEMENT,
@@ -36,7 +38,7 @@ public:
             ACTIVATE_ROM,
             DEACTIVATE_ROM
         };
-        typedef uint8_t value_t;
+        typedef uint64_t value_t;
         typedef Timer::value_t time_t;
         time_t time;
         type_t type;
@@ -44,7 +46,9 @@ public:
         void INTR_ATTR operator =(volatile event_t& e) volatile;
     };
     class Rom {
-        friend void INTR_ATTR OneWire::_pinISR();
+        friend void OneWire::_pinISR();
+        friend void OneWire::_slaveProcessReceivedByte();
+
         Rom(const Rom&) = delete;
 
     public:
@@ -156,7 +160,7 @@ private:
     bool _readBit();
 
     void INTR_ATTR _slaveWriteBit(const bool v);
-    void INTR_ATTR _slaveReadBit();  // reads to m_receivingByte
+    bool INTR_ATTR _slaveReadBit();  // reads to m_receivingByte
     void INTR_ATTR _slaveSearchSendBit(bool complement);
 
     void INTR_ATTR _event(event_t::type_t type, event_t::value_t value);

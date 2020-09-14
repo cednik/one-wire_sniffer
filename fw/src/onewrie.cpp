@@ -404,14 +404,43 @@ void OneWire::_slaveWriteBit(const bool v) {
     }
 }
 
-void OneWire::_slaveReadBit() { // reads to m_receivingByte
+bool OneWire::_slaveReadBit() { // reads to m_receivingByte
     m_edgeTime = wait<Timer>(m_timing->K);
     m_receivingByte >>= 1;
-    if (m_input.read()) {
+    const bool res = m_input.read();
+    if (res) {
         m_receivingByte |= 0x80;
     } else {
         m_state = State::CHECK_RESET;
         m_input.interruptTrigger(RISING);
+    }
+    return res;
+}
+
+void OneWire::_slaveProcessReceivedByte() {
+    if (++m_bitIndex == 8) {
+        if (m_slaveSearchState == SlaveSearchState::READY) {
+            if ((m_receivingByte == uint8_t(CMD::SEARCH) || m_receivingByte == uint8_t(CMD::SEARCH_ALARM))) {
+                m_slaveSearchState = SlaveSearchState::SEND_BIT;
+                m_state = State::SEARCH;
+            } else {
+                m_slaveSearchState = SlaveSearchState::IDLE;
+            }
+        }
+        const event_t e = {
+            .time = Timer::value(),
+            .type = event_t::type_t::RECEIVED,
+            .value = m_receivingByte
+        };
+        for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
+            if (m_rom[i] == nullptr)
+                break;
+            if (m_rom[i]->isActive())
+                m_rom[i]->event(e);
+        }
+        _event(e);
+        m_receivingByte = 0;
+        m_bitIndex = 0;
     }
 }
 
@@ -488,37 +517,22 @@ void OneWire::_pinISR() {
             _event(e);
             m_state = State::READ;
         } else {
-            m_state = ( m_slaveSearchState == SlaveSearchState::IDLE
-                        || m_slaveSearchState == SlaveSearchState::READY ) ? State::READ : State::SEARCH;
+            if (m_slaveSearchState == SlaveSearchState::IDLE
+             || m_slaveSearchState == SlaveSearchState::READY) {
+                _event(event_t::type_t::RECEIVED_BIT, m_bitIndex);
+                m_state = State::READ;
+                _slaveProcessReceivedByte();
+            } else {
+                m_state = State::SEARCH;
+            }
         }
         m_input.interruptTrigger(FALLING);
         m_input.clearInterruptFlag();
         break;
     case State::READ:
-        _slaveReadBit();
-        if (++m_bitIndex == 8) {
-            if (m_slaveSearchState == SlaveSearchState::READY) {
-                if ((m_receivingByte == uint8_t(CMD::SEARCH) || m_receivingByte == uint8_t(CMD::SEARCH_ALARM))) {
-                    m_slaveSearchState = SlaveSearchState::SEND_BIT;
-                    m_state = State::SEARCH;
-                } else {
-                    m_slaveSearchState = SlaveSearchState::IDLE;
-                }
-            }
-            const event_t e = {
-                .time = Timer::value(),
-                .type = event_t::type_t::RECEIVED,
-                .value = m_receivingByte
-            };
-            for (roms_count_t i = 0; i != MAX_ROMS; ++i) {
-                if (m_rom[i] == nullptr)
-                    break;
-                if (m_rom[i]->isActive())
-                    m_rom[i]->event(e);
-            }
-            _event(e);
-            m_receivingByte = 0;
-            m_bitIndex = 0;
+        if (_slaveReadBit()) {
+            _event(event_t::type_t::RECEIVED_BIT, m_bitIndex | 0x80);
+            _slaveProcessReceivedByte();
         }
         break;
     case State::WRITE:
@@ -535,11 +549,11 @@ void OneWire::_pinISR() {
         case SlaveSearchState::READY:
             break;
         case SlaveSearchState::SEND_BIT:
-            _slaveSearchSendBit(false);
+            _slaveSearchSendBit(0);
             m_slaveSearchState = SlaveSearchState::SEND_COMPLEMENT;
             break;
         case SlaveSearchState::SEND_COMPLEMENT:
-            _slaveSearchSendBit(true);
+            _slaveSearchSendBit(1);
             m_slaveSearchState = SlaveSearchState::READ_BIT;
             break;
         case SlaveSearchState::READ_BIT:

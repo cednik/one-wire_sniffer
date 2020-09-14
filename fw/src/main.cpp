@@ -55,6 +55,7 @@ static void oneWireMaster(void* args = nullptr) {
                 ow.resetSearch();
                 foundDevices = 0;
                 while(ow.search()) {
+                    taskYIELD(); // time for slave thread to print accumulated events
                     print("  Found {}. device at 0x{:016X}\n", ++foundDevices, ow.LastFoundRom().value);
                 }
                 print("Search complete, {} device{} found.\n", foundDevices, foundDevices == 1 ? "" : "s");
@@ -110,29 +111,32 @@ static void oneWireSlave(void* args = nullptr) {
             Printer::acquire();
             print("{:10}\tOneWireSlave: ", eventTime);
             switch(eventType) {
-            case OneWire::event_t::type_t::RECEIVED:
-                print("receive 0x{:02X}\n", eventValue);
-                break;
             case OneWire::event_t::type_t::RESET:
                 print("reset\n");
+                break;
+            case OneWire::event_t::type_t::RECEIVED_BIT:
+                print("receive_bit {}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                break;
+            case OneWire::event_t::type_t::RECEIVED:
+                print("receive_byte 0x{:02X}\n", eventValue);
                 break;
             case OneWire::event_t::type_t::SEARCH_START:
                 print("search start\n");
                 break;
             case OneWire::event_t::type_t::SEARCH_SEND_BIT:
-                print("search send  bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search send  bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_SEND_COMPLEMENT:
-                print("search send ~bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search send ~bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_READ_BIT:
-                print("search READ  bit {}: {}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search READ  bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_COMPLETE:
                 print("search complete\n");
                 break;
             default:
-                print("unknown 0x{:02X} = 0x{:02X}\n", uint8_t(eventType), eventValue);
+                print("unknown 0x{:02X} = 0x{:016X}\n", uint8_t(eventType), eventValue);
                 break;
             }
             Printer::release();
@@ -181,7 +185,7 @@ void setup() {
 
     Pin::initInterrupts();
 
-    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 4*1024, nullptr, 4, nullptr, 0);
+    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 8*1024, nullptr, 4, nullptr, 0);
     xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 8*1024, nullptr, 4, nullptr, 1);
     delay(500);
 }
