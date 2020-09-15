@@ -2,9 +2,6 @@
 
 #include "print.hpp"
 
-#undef GPIO_PRO_CPU_INTR_ENA
-#define GPIO_PRO_CPU_INTR_ENA (BIT(3)) // Errornously defined as (BIT(2)) in arduino-esp32
-
 extern Pin isrOut;
 
 Pin::InterruptRecord::InterruptRecord(uint8_t cpu, interruptIndex_t index)
