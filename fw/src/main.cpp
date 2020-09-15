@@ -81,6 +81,10 @@ static void oneWireMaster(void* args = nullptr) {
     }
 }
 
+static inline double t2us(OneWire::event_t::time_t t) {
+    return t / 240.0;
+}
+
 [[maybe_unused]]
 static void oneWireSlave(void* args = nullptr) {
     const Pin::pin_num_t onewirePin = ONEWIRE_SLAVE_PIN;
@@ -100,19 +104,23 @@ static void oneWireSlave(void* args = nullptr) {
         print("ROM{}: {:02X}\n", i, fmt::join(*slaveRom[i], " "));
     }
     ow.selfAdvertising(true);
+    OneWire::event_t::time_t lastEventTime = 0;
+    OneWire::event_t::time_t lastResetTime = 0;
     for(;;) {
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
         while (ow.available()) {
             OneWire::event_t e = ow.getLastEvent();
+            ow.popEvent();
             OneWire::event_t::time_t eventTime   = e.time;
             OneWire::event_t::type_t eventType   = e.type;
             OneWire::event_t::value_t eventValue = e.value;
-            ow.popEvent();
             Printer::acquire();
-            print("{:10}\tOneWireSlave: ", eventTime);
+            print("{:12.3f}\t{:12.3f}\t{:12.3f}\tOneWireSlave: ", t2us(eventTime), t2us(eventTime - lastResetTime), t2us(eventTime - lastEventTime));
+            lastEventTime = eventTime;
             switch(eventType) {
             case OneWire::event_t::type_t::RESET:
-                print("reset\n");
+                print("reset: {} slave on bus\n", eventValue ? "any" : "no");
+                lastResetTime = eventTime;
                 break;
             case OneWire::event_t::type_t::RECEIVED_BIT:
                 print("receive_bit {}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
@@ -124,16 +132,19 @@ static void oneWireSlave(void* args = nullptr) {
                 print("search start\n");
                 break;
             case OneWire::event_t::type_t::SEARCH_SEND_BIT:
-                print("search send  bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search send  bit {:2}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_SEND_COMPLEMENT:
-                print("search send ~bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search send ~bit {:2}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_READ_BIT:
-                print("search READ  bit {:02}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
+                print("search READ  bit {:2}: {:d}\n", eventValue & 0x7F, bool(eventValue & 0x80));
                 break;
             case OneWire::event_t::type_t::SEARCH_COMPLETE:
-                print("search complete\n");
+                print("search complete, found rom 0x{:016X}\n", eventValue);
+                break;
+            case OneWire::event_t::type_t::STATE_CHECK:
+                print("slave state = {:2}\n", eventValue);
                 break;
             default:
                 print("unknown 0x{:02X} = 0x{:016X}\n", uint8_t(eventType), eventValue);
@@ -151,7 +162,7 @@ static void oneWireSlave(void* args = nullptr) {
                 OneWire::event_t::value_t eventValue = e.value;
                 rom->popEvent();
                 Printer::acquire();
-                print("{:10}\tOneWireSlave::Rom 0x{:016X}: ", eventTime, rom->value().value);
+                print("{:12.3f}\tOneWireSlave::Rom 0x{:016X}: ", t2us(eventTime), rom->value().value);
                 switch(eventType) {
                 case OneWire::event_t::type_t::RECEIVED:
                     print("receive 0x{:02X}\n", eventValue);
@@ -175,6 +186,9 @@ static void oneWireSlave(void* args = nullptr) {
     }
 }
 
+#define MASTER_CORE CONFIG_ARDUINO_RUNNING_CORE
+#define SLAVE_CORE (MASTER_CORE == 1 ? 0 : 1)
+
 void setup() {
     Serial.begin(115200);
     Printer::begin();
@@ -185,8 +199,8 @@ void setup() {
 
     Pin::initInterrupts();
 
-    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 8*1024, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 8*1024, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(oneWireMaster, "OneWireMaster", 8*1024, nullptr, 4, nullptr, MASTER_CORE);
+    xTaskCreatePinnedToCore(oneWireSlave , "OneWireSlave" , 8*1024, nullptr, 4, nullptr, SLAVE_CORE);
     delay(500);
 }
 
